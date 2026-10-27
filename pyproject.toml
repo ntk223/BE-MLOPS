@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "learnguard-backend"
+version = "0.1.0"
+description = "LearnGuard advisor API scaffold"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.30,<1",
+  "sqlalchemy>=2,<3",
+  "psycopg[binary]>=3.2,<4",
+  "pydantic>=2.9,<3",
+  "pydantic-settings>=2.5,<3",
+  "python-jose[cryptography]>=3.3,<4",
+  "passlib[bcrypt]>=1.7,<2",
+  "email-validator>=2.2,<3",
+  "openai>=1.50,<3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
