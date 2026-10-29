@@ -42,8 +42,21 @@ docker compose -f compose.ollama.yml up -d
 docker compose -f compose.ollama.yml exec ollama ollama pull qwen2.5:3b
 ```
 
-`.env.example` cấu hình model fallback là `ollama/qwen2.5:3b` tại `http://localhost:11434`. Backend thử lại bằng Ollama khi provider chính gặp lỗi; nếu cả hai lỗi, `LLMFailoverError` được ném ra thay vì trả kết quả giả. Đặt `LLM_FALLBACK_MODEL` rỗng hoặc bỏ biến này để tắt fallback. Model được giữ trong volume `ollama_models`; dịch vụ chỉ bind vào loopback máy chủ. Tùy chỉnh `OLLAMA_PORT` nếu cổng mặc định `11434` đã được sử dụng và cập nhật `LLM_FALLBACK_API_BASE` tương ứng.
+`.env.example` cấu hình model fallback là `ollama/qwen2.5:3b` tại `http://localhost:11434`. Backend thử lại bằng Ollama khi provider chính gặp lỗi; fallback có timeout riêng `LLM_FALLBACK_TIMEOUT_SECONDS` (mặc định `120` giây) để chờ model local nạp/chạy inference. Nếu cả hai lỗi, `LLMFailoverError` được ném ra thay vì trả kết quả giả. Đặt `LLM_FALLBACK_MODEL` rỗng hoặc bỏ biến này để tắt fallback. Model được giữ trong volume `ollama_models`; dịch vụ chỉ bind vào loopback máy chủ. Tùy chỉnh `OLLAMA_PORT` nếu cổng mặc định `11434` đã được sử dụng và cập nhật `LLM_FALLBACK_API_BASE` tương ứng.
 
 Mỗi request giới hạn mặc định tối đa `8.000` token đầu vào (`LLM_MAX_INPUT_TOKENS`) và `1.000` token đầu ra (`LLM_MAX_OUTPUT_TOKENS`). Đầu vào được đếm bằng LiteLLM theo model trước khi gửi; request vượt giới hạn bị từ chối. Giới hạn đầu ra được truyền tới provider và không thể bị ghi đè từ tùy chọn từng request.
 
-Tạo client với `LiteLLMClient.from_environment()` hoặc `LiteLLMClient.from_settings(settings)`. Gọi `complete(messages, ...)` hoặc `await acomplete(messages, ...)`; các tùy chọn riêng của model/provider có thể truyền tiếp dưới dạng keyword arguments. Khi fallback được cấu hình, lỗi provider chính sẽ kích hoạt thử model fallback; nếu cả hai thất bại, client ném `LLMFailoverError` và giữ nguyên lỗi của từng provider để chẩn đoán. Nếu không cấu hình fallback, lỗi provider chính được truyền lại như trước. `tenacity` được khai báo trực tiếp vì LiteLLM cần dependency này để thực hiện retry trong một số luồng lỗi.
+Các bước điều phối trong backend dùng service dùng chung bằng cách import `get_llm_service()` từ `learnguard_backend.services.llm`. Factory khởi tạo cấu hình từ environment ở lần gọi đầu tiên và tái sử dụng một instance trong suốt vòng đời process:
+
+```python
+from learnguard_backend.services.llm import get_llm_service
+
+llm = get_llm_service()
+result = llm.complete(
+    [{"role": "user", "content": "Summarize this orchestration step."}],
+    temperature=0.2,
+)
+# Trong luồng async: result = await llm.acomplete(messages, temperature=0.2)
+```
+
+Gọi `complete(messages, ...)` hoặc `await acomplete(messages, ...)`; các tùy chọn riêng của model/provider có thể truyền tiếp dưới dạng keyword arguments. Kết quả bao gồm nội dung, model thực tế, usage, latency và cost nếu provider cung cấp. Khi fallback được cấu hình, lỗi provider chính sẽ kích hoạt thử model fallback; nếu cả hai thất bại, client ném `LLMFailoverError` và giữ nguyên lỗi của từng provider để chẩn đoán. Nếu không cấu hình fallback, lỗi provider chính được truyền lại như trước. Các thay đổi environment được áp dụng sau khi khởi động lại backend. `tenacity` được khai báo trực tiếp vì LiteLLM cần dependency này để thực hiện retry trong một số luồng lỗi.

@@ -1,6 +1,7 @@
 """Provider-agnostic chat completions powered by LiteLLM."""
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from importlib import import_module
 import math
 from numbers import Real
@@ -82,6 +83,7 @@ class LiteLLMClient:
         fallback_model: str | None = None,
         fallback_api_key: str | None = None,
         fallback_api_base: str | None = None,
+        fallback_timeout_seconds: float = 120.0,
     ) -> None:
         if not model.strip():
             raise LLMConfigurationError("An LLM model must be configured.")
@@ -97,6 +99,14 @@ class LiteLLMClient:
             or max_retries < 0
         ):
             raise LLMConfigurationError("LLM max_retries must be a non-negative integer.")
+        if (
+            isinstance(fallback_timeout_seconds, bool)
+            or not math.isfinite(fallback_timeout_seconds)
+            or fallback_timeout_seconds <= 0
+        ):
+            raise LLMConfigurationError(
+                "LLM fallback timeout must be greater than zero."
+            )
         if (
             isinstance(max_input_tokens, bool)
             or not isinstance(max_input_tokens, int)
@@ -126,7 +136,7 @@ class LiteLLMClient:
                 fallback_model,
                 api_key=fallback_api_key,
                 api_base=fallback_api_base,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=fallback_timeout_seconds,
                 max_retries=max_retries,
                 max_input_tokens=max_input_tokens,
                 max_output_tokens=max_output_tokens,
@@ -148,6 +158,7 @@ class LiteLLMClient:
             fallback_model=settings.llm_fallback_model,
             fallback_api_key=settings.llm_fallback_api_key,
             fallback_api_base=settings.llm_fallback_api_base,
+            fallback_timeout_seconds=settings.llm_fallback_timeout_seconds,
         )
 
     @classmethod
@@ -332,3 +343,32 @@ class LiteLLMClient:
         if isinstance(value, Mapping):
             return value.get(name, default)
         return getattr(value, name, default)
+
+
+class LLMService:
+    """Reusable LLM interface for orchestration and backend services."""
+
+    def __init__(self, client: LiteLLMClient) -> None:
+        self._client = client
+
+    def complete(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        **request_options: Any,
+    ) -> LLMResponse:
+        """Generate a completion using the configured primary/fallback models."""
+        return self._client.complete(messages, **request_options)
+
+    async def acomplete(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        **request_options: Any,
+    ) -> LLMResponse:
+        """Generate a completion asynchronously using the configured models."""
+        return await self._client.acomplete(messages, **request_options)
+
+
+@lru_cache(maxsize=1)
+def get_llm_service() -> LLMService:
+    """Return the process-wide LLM service configured from the environment."""
+    return LLMService(LiteLLMClient.from_environment())

@@ -10,6 +10,8 @@ from learnguard_backend.services.llm import (
     LLMFailoverError,
     LLMResponseError,
     LiteLLMClient,
+    LLMService,
+    get_llm_service,
 )
 from learnguard_backend.settings import BackendSettings
 import learnguard_backend.settings as settings_module
@@ -79,6 +81,7 @@ class LiteLLMClientTests(unittest.TestCase):
             "openai/gpt-4o-mini",
             fallback_model="ollama/qwen2.5:3b",
             fallback_api_base="http://localhost:11434",
+            fallback_timeout_seconds=120,
         )
         with patch.dict(sys.modules, {"litellm": provider}):
             result = client.complete(self.messages)
@@ -89,6 +92,9 @@ class LiteLLMClientTests(unittest.TestCase):
         self.assertEqual(
             provider.completion.call_args_list[1].kwargs["api_base"],
             "http://localhost:11434",
+        )
+        self.assertEqual(
+            provider.completion.call_args_list[1].kwargs["timeout"], 120
         )
 
     def test_complete_reports_error_when_both_providers_fail(self) -> None:
@@ -143,6 +149,7 @@ class LiteLLMClientTests(unittest.TestCase):
                 "LLM_FALLBACK_MODEL": "ollama/qwen2.5:3b",
                 "LLM_FALLBACK_API_BASE": "http://localhost:11434",
                 "LLM_FALLBACK_API_KEY": "ollama",
+                "LLM_FALLBACK_TIMEOUT_SECONDS": "180",
             },
             clear=True,
         ):
@@ -157,9 +164,11 @@ class LiteLLMClientTests(unittest.TestCase):
         self.assertEqual(settings.llm_fallback_model, "ollama/qwen2.5:3b")
         self.assertEqual(settings.llm_fallback_api_base, "http://localhost:11434")
         self.assertEqual(settings.llm_fallback_api_key, "ollama")
+        self.assertEqual(settings.llm_fallback_timeout_seconds, 180)
         client = LiteLLMClient.from_settings(settings)
         self.assertIsNotNone(client.fallback_client)
         self.assertEqual(client.fallback_client.model, "ollama/qwen2.5:3b")
+        self.assertEqual(client.fallback_client.timeout_seconds, 180)
 
     def test_loads_dotenv_file_without_overriding_process_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -248,6 +257,35 @@ class AsyncLiteLLMClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.content, "Fallback reply")
         self.assertEqual(result.model, "ollama/qwen2.5:3b")
         self.assertEqual(calls, 2)
+
+
+class LLMServiceTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        get_llm_service.cache_clear()
+
+    def test_service_delegates_sync_calls_to_client(self) -> None:
+        client = unittest.mock.Mock(spec=LiteLLMClient)
+        expected = SimpleNamespace(content="Generated")
+        client.complete.return_value = expected
+        service = LLMService(client)
+        messages = [{"role": "user", "content": "Hello"}]
+
+        result = service.complete(messages, temperature=0.3)
+
+        self.assertIs(result, expected)
+        client.complete.assert_called_once_with(messages, temperature=0.3)
+
+    def test_factory_returns_a_shared_configured_service(self) -> None:
+        with patch.object(
+            LiteLLMClient,
+            "from_environment",
+            return_value=LiteLLMClient("openai/gpt-4o-mini"),
+        ) as configured_client:
+            first = get_llm_service()
+            second = get_llm_service()
+
+        self.assertIs(first, second)
+        configured_client.assert_called_once_with()
 
 
 if __name__ == "__main__":
