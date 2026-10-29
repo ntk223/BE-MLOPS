@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from learnguard_backend.services.llm import (
     LLMConfigurationError,
+    LLMFailoverError,
     LLMResponseError,
     LiteLLMClient,
 )
@@ -64,6 +65,51 @@ class LiteLLMClientTests(unittest.TestCase):
             model="openai/gpt-4o-mini", messages=self.messages
         )
 
+    def test_complete_uses_fallback_when_primary_provider_fails(self) -> None:
+        fallback_response_data = vars(self.response).copy()
+        fallback_response_data["model"] = "ollama/qwen2.5:3b"
+        fallback_response = SimpleNamespace(**fallback_response_data)
+        provider = SimpleNamespace(
+            completion=unittest.mock.Mock(
+                side_effect=[RuntimeError("primary unavailable"), fallback_response]
+            ),
+            token_counter=unittest.mock.Mock(return_value=4),
+        )
+        client = LiteLLMClient(
+            "openai/gpt-4o-mini",
+            fallback_model="ollama/qwen2.5:3b",
+            fallback_api_base="http://localhost:11434",
+        )
+        with patch.dict(sys.modules, {"litellm": provider}):
+            result = client.complete(self.messages)
+
+        self.assertEqual(result.content, "Hi")
+        self.assertEqual(result.model, "ollama/qwen2.5:3b")
+        self.assertEqual(provider.completion.call_count, 2)
+        self.assertEqual(
+            provider.completion.call_args_list[1].kwargs["api_base"],
+            "http://localhost:11434",
+        )
+
+    def test_complete_reports_error_when_both_providers_fail(self) -> None:
+        provider = SimpleNamespace(
+            completion=unittest.mock.Mock(
+                side_effect=[RuntimeError("primary unavailable"), RuntimeError("fallback unavailable")]
+            ),
+            token_counter=unittest.mock.Mock(return_value=4),
+        )
+        client = LiteLLMClient(
+            "openai/gpt-4o-mini",
+            fallback_model="ollama/qwen2.5:3b",
+        )
+        with patch.dict(sys.modules, {"litellm": provider}):
+            with self.assertRaises(LLMFailoverError) as error:
+                client.complete(self.messages)
+
+        self.assertIsInstance(error.exception.__cause__, RuntimeError)
+        self.assertEqual(str(error.exception.primary_error), "primary unavailable")
+        self.assertEqual(provider.completion.call_count, 2)
+
     def test_rejects_empty_messages_and_reserved_options(self) -> None:
         with self.assertRaisesRegex(ValueError, "At least one"):
             self.client.complete([])
@@ -94,6 +140,9 @@ class LiteLLMClientTests(unittest.TestCase):
                 "LLM_MAX_RETRIES": "3",
                 "LLM_MAX_INPUT_TOKENS": "7000",
                 "LLM_MAX_OUTPUT_TOKENS": "900",
+                "LLM_FALLBACK_MODEL": "ollama/qwen2.5:3b",
+                "LLM_FALLBACK_API_BASE": "http://localhost:11434",
+                "LLM_FALLBACK_API_KEY": "ollama",
             },
             clear=True,
         ):
@@ -105,6 +154,12 @@ class LiteLLMClientTests(unittest.TestCase):
         self.assertEqual(settings.llm_max_retries, 3)
         self.assertEqual(settings.llm_max_input_tokens, 7000)
         self.assertEqual(settings.llm_max_output_tokens, 900)
+        self.assertEqual(settings.llm_fallback_model, "ollama/qwen2.5:3b")
+        self.assertEqual(settings.llm_fallback_api_base, "http://localhost:11434")
+        self.assertEqual(settings.llm_fallback_api_key, "ollama")
+        client = LiteLLMClient.from_settings(settings)
+        self.assertIsNotNone(client.fallback_client)
+        self.assertEqual(client.fallback_client.model, "ollama/qwen2.5:3b")
 
     def test_loads_dotenv_file_without_overriding_process_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -157,6 +212,42 @@ class AsyncLiteLLMClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.content, "Async reply")
         self.assertIsNone(result.cost_usd)
+
+    async def test_acomplete_uses_fallback_when_primary_provider_fails(self) -> None:
+        fallback_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="Fallback reply", tool_calls=[]),
+                    finish_reason="stop",
+                )
+            ],
+            model="ollama/qwen2.5:3b",
+            usage=None,
+            _hidden_params={},
+        )
+        calls = 0
+
+        async def acompletion(**_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("primary unavailable")
+            return fallback_response
+
+        provider = SimpleNamespace(
+            acompletion=acompletion,
+            token_counter=unittest.mock.Mock(return_value=4),
+        )
+        client = LiteLLMClient(
+            "openai/gpt-4o-mini",
+            fallback_model="ollama/qwen2.5:3b",
+        )
+        with patch.dict(sys.modules, {"litellm": provider}):
+            result = await client.acomplete([{"role": "user", "content": "Hello"}])
+
+        self.assertEqual(result.content, "Fallback reply")
+        self.assertEqual(result.model, "ollama/qwen2.5:3b")
+        self.assertEqual(calls, 2)
 
 
 if __name__ == "__main__":

@@ -33,6 +33,17 @@ Trong `.env`, thay `LLM_API_KEY` bằng OpenRouter API key của bạn rồi lư
 
 Mẫu `.env.example` dùng `openrouter/google/gemini-2.5-flash:free` và endpoint OpenRouter. Nếu model free này không còn khả dụng trên tài khoản, thay `LLM_MODEL` bằng slug `:free` đang được OpenRouter cung cấp. Các thiết lập khác gồm `LLM_TIMEOUT_SECONDS` mặc định `30`, `LLM_MAX_RETRIES` mặc định `2`, và có thể cấu hình qua `.env`.
 
+### Ollama fallback tự host
+
+Fallback Ollama được bật khi `LLM_FALLBACK_MODEL` được cấu hình. Khởi chạy service bằng Docker Compose và tải model một lần:
+
+```powershell
+docker compose -f compose.ollama.yml up -d
+docker compose -f compose.ollama.yml exec ollama ollama pull qwen2.5:3b
+```
+
+`.env.example` cấu hình model fallback là `ollama/qwen2.5:3b` tại `http://localhost:11434`. Backend thử lại bằng Ollama khi provider chính gặp lỗi; nếu cả hai lỗi, `LLMFailoverError` được ném ra thay vì trả kết quả giả. Đặt `LLM_FALLBACK_MODEL` rỗng hoặc bỏ biến này để tắt fallback. Model được giữ trong volume `ollama_models`; dịch vụ chỉ bind vào loopback máy chủ. Tùy chỉnh `OLLAMA_PORT` nếu cổng mặc định `11434` đã được sử dụng và cập nhật `LLM_FALLBACK_API_BASE` tương ứng.
+
 Mỗi request giới hạn mặc định tối đa `8.000` token đầu vào (`LLM_MAX_INPUT_TOKENS`) và `1.000` token đầu ra (`LLM_MAX_OUTPUT_TOKENS`). Đầu vào được đếm bằng LiteLLM theo model trước khi gửi; request vượt giới hạn bị từ chối. Giới hạn đầu ra được truyền tới provider và không thể bị ghi đè từ tùy chọn từng request.
 
-Tạo client với `LiteLLMClient.from_environment()` hoặc `LiteLLMClient.from_settings(settings)`. Gọi `complete(messages, ...)` hoặc `await acomplete(messages, ...)`; các tùy chọn riêng của model/provider có thể truyền tiếp dưới dạng keyword arguments. Ngoại lệ từ LiteLLM/provider được truyền lại để tầng gọi quyết định cách xử lý/fallback. `tenacity` được khai báo trực tiếp vì LiteLLM cần dependency này để thực hiện retry trong một số luồng lỗi.
+Tạo client với `LiteLLMClient.from_environment()` hoặc `LiteLLMClient.from_settings(settings)`. Gọi `complete(messages, ...)` hoặc `await acomplete(messages, ...)`; các tùy chọn riêng của model/provider có thể truyền tiếp dưới dạng keyword arguments. Khi fallback được cấu hình, lỗi provider chính sẽ kích hoạt thử model fallback; nếu cả hai thất bại, client ném `LLMFailoverError` và giữ nguyên lỗi của từng provider để chẩn đoán. Nếu không cấu hình fallback, lỗi provider chính được truyền lại như trước. `tenacity` được khai báo trực tiếp vì LiteLLM cần dependency này để thực hiện retry trong một số luồng lỗi.

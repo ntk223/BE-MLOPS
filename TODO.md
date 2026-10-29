@@ -8,6 +8,7 @@
 - [ ] Implement SQLAlchemy entities, migration, repository và transaction boundaries.
 - [ ] Ghi audit cho auth, prediction access, brief và quyết định; không log PII/secrets.
 - [x] Thêm shared LiteLLM client với timeout/retry giới hạn và chuẩn hóa kết quả.
+- [x] Triển khai Ollama tự host làm LLM fallback có thể bật qua cấu hình.
 - [ ] Tích hợp LLM vào brief generation, citation validator và explicit fallback.
 - [ ] Thêm API smoke tests, error contracts và OpenAPI review.
 - [ ] Thêm container build/run config sau khi health route và settings hoàn thành.

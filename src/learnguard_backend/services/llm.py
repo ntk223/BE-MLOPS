@@ -18,6 +18,25 @@ class LLMResponseError(RuntimeError):
     """Raised when a provider returns an unusable completion response."""
 
 
+class LLMFailoverError(RuntimeError):
+    """Raised when both the primary and fallback LLM providers fail."""
+
+    def __init__(
+        self,
+        primary_model: str,
+        fallback_model: str,
+        primary_error: Exception,
+        fallback_error: Exception,
+    ) -> None:
+        self.primary_error = primary_error
+        self.fallback_error = fallback_error
+        super().__init__(
+            f"Primary model '{primary_model}' failed with "
+            f"{type(primary_error).__name__}; fallback model '{fallback_model}' "
+            f"failed with {type(fallback_error).__name__}."
+        )
+
+
 @dataclass(frozen=True)
 class LLMUsage:
     prompt_tokens: int | None = None
@@ -60,6 +79,9 @@ class LiteLLMClient:
         max_retries: int = 2,
         max_input_tokens: int = 8000,
         max_output_tokens: int = 1000,
+        fallback_model: str | None = None,
+        fallback_api_key: str | None = None,
+        fallback_api_base: str | None = None,
     ) -> None:
         if not model.strip():
             raise LLMConfigurationError("An LLM model must be configured.")
@@ -99,6 +121,19 @@ class LiteLLMClient:
         self.max_retries = max_retries
         self.max_input_tokens = max_input_tokens
         self.max_output_tokens = max_output_tokens
+        self.fallback_client = (
+            LiteLLMClient(
+                fallback_model,
+                api_key=fallback_api_key,
+                api_base=fallback_api_base,
+                timeout_seconds=timeout_seconds,
+                max_retries=max_retries,
+                max_input_tokens=max_input_tokens,
+                max_output_tokens=max_output_tokens,
+            )
+            if fallback_model
+            else None
+        )
 
     @classmethod
     def from_settings(cls, settings: BackendSettings) -> "LiteLLMClient":
@@ -110,6 +145,9 @@ class LiteLLMClient:
             max_retries=settings.llm_max_retries,
             max_input_tokens=settings.llm_max_input_tokens,
             max_output_tokens=settings.llm_max_output_tokens,
+            fallback_model=settings.llm_fallback_model,
+            fallback_api_key=settings.llm_fallback_api_key,
+            fallback_api_base=settings.llm_fallback_api_base,
         )
 
     @classmethod
@@ -121,11 +159,63 @@ class LiteLLMClient:
         messages: Sequence[Mapping[str, Any]],
         **request_options: Any,
     ) -> LLMResponse:
-        """Run a synchronous chat completion; provider errors are propagated."""
+        """Run a synchronous completion, using the configured fallback on provider failure."""
         self._validate_request(messages, request_options)
         litellm = import_module("litellm")
         self._validate_input_tokens(litellm, messages)
 
+        try:
+            return self._complete_with(litellm, messages, request_options)
+        except Exception as primary_error:
+            if self.fallback_client is None:
+                raise
+            try:
+                self.fallback_client._validate_input_tokens(litellm, messages)
+                return self.fallback_client._complete_with(
+                    litellm, messages, request_options
+                )
+            except Exception as fallback_error:
+                raise LLMFailoverError(
+                    self.model,
+                    self.fallback_client.model,
+                    primary_error,
+                    fallback_error,
+                ) from fallback_error
+
+    async def acomplete(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        **request_options: Any,
+    ) -> LLMResponse:
+        """Run an asynchronous completion, using the configured fallback on provider failure."""
+        self._validate_request(messages, request_options)
+        litellm = import_module("litellm")
+        self._validate_input_tokens(litellm, messages)
+
+        try:
+            return await self._acomplete_with(litellm, messages, request_options)
+        except Exception as primary_error:
+            if self.fallback_client is None:
+                raise
+            try:
+                self.fallback_client._validate_input_tokens(litellm, messages)
+                return await self.fallback_client._acomplete_with(
+                    litellm, messages, request_options
+                )
+            except Exception as fallback_error:
+                raise LLMFailoverError(
+                    self.model,
+                    self.fallback_client.model,
+                    primary_error,
+                    fallback_error,
+                ) from fallback_error
+
+    def _complete_with(
+        self,
+        litellm: Any,
+        messages: Sequence[Mapping[str, Any]],
+        request_options: Mapping[str, Any],
+    ) -> LLMResponse:
         started_at = perf_counter()
         response = litellm.completion(
             **self._request_arguments(messages, request_options)
@@ -134,16 +224,12 @@ class LiteLLMClient:
             response, int((perf_counter() - started_at) * 1000)
         )
 
-    async def acomplete(
+    async def _acomplete_with(
         self,
+        litellm: Any,
         messages: Sequence[Mapping[str, Any]],
-        **request_options: Any,
+        request_options: Mapping[str, Any],
     ) -> LLMResponse:
-        """Run an asynchronous chat completion; provider errors are propagated."""
-        self._validate_request(messages, request_options)
-        litellm = import_module("litellm")
-        self._validate_input_tokens(litellm, messages)
-
         started_at = perf_counter()
         response = await litellm.acompletion(
             **self._request_arguments(messages, request_options)

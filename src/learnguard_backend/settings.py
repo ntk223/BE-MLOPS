@@ -18,6 +18,9 @@ class BackendSettings:
     llm_api_key: str | None = None
     llm_model: str = "gemini-3.8-flash"
     llm_api_base: str | None = None
+    llm_fallback_model: str | None = None
+    llm_fallback_api_key: str | None = None
+    llm_fallback_api_base: str | None = None
     llm_timeout_seconds: float = 30.0
     llm_max_retries: int = 2
     llm_max_input_tokens: int = 8000
@@ -56,6 +59,9 @@ class BackendSettings:
             llm_api_key=os.getenv("LLM_API_KEY") or None,
             llm_model=os.getenv("LLM_MODEL", ""),
             llm_api_base=os.getenv("LLM_API_BASE") or None,
+            llm_fallback_model=os.getenv("LLM_FALLBACK_MODEL") or None,
+            llm_fallback_api_key=os.getenv("LLM_FALLBACK_API_KEY") or None,
+            llm_fallback_api_base=os.getenv("LLM_FALLBACK_API_BASE") or None,
             llm_timeout_seconds=timeout_seconds,
             llm_max_retries=max_retries,
             llm_max_input_tokens=max_input_tokens,
