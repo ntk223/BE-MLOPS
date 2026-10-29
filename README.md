@@ -11,10 +11,28 @@ Git repository riêng cho M6 API, M7 persistence, M8 advisor brief và phần au
 
 ## Module map
 
-- `src/learnguard/api/`: app factory, controllers, auth và request/response DTO.
-- `src/learnguard/db/`: records, repository interfaces và session contract.
-- `src/learnguard/services/briefs.py`: brief generation/validation/fallback contract.
-- `src/learnguard/observability.py`: audit, request metrics và run summary contracts.
-- `src/learnguard/settings.py`: backend-only runtime configuration.
+- `src/learnguard_backend/api/`: app factory, controllers, auth và request/response DTO.
+- `src/learnguard_backend/db/`: records, repository interfaces và session contract.
+- `src/learnguard_backend/services/briefs.py`: brief generation/validation/fallback contract.
+- `src/learnguard_backend/services/llm.py`: client LLM dùng LiteLLM, hỗ trợ chat completion đồng bộ/bất đồng bộ và chuẩn hóa usage/cost/latency.
+- `src/learnguard_backend/observability.py`: audit, request metrics và run summary contracts.
+- `src/learnguard_backend/settings.py`: backend-only runtime configuration.
 
 Core methods đang để TODO/`NotImplementedError`. Xem `TODO.md` cho thứ tự triển khai. Chưa có Dockerfile hoặc Compose chạy được.
+
+## LLM configuration
+
+Tạo file cấu hình một lần bằng PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+notepad .env
+```
+
+Trong `.env`, thay `LLM_API_KEY` bằng OpenRouter API key của bạn rồi lưu file. Settings tự đọc `.env` ở thư mục gốc backend; biến môi trường đã được đặt trong process sẽ được ưu tiên hơn giá trị trong file. `.env` được Git bỏ qua; không commit hoặc chia sẻ file này.
+
+Mẫu `.env.example` dùng `openrouter/google/gemini-2.5-flash:free` và endpoint OpenRouter. Nếu model free này không còn khả dụng trên tài khoản, thay `LLM_MODEL` bằng slug `:free` đang được OpenRouter cung cấp. Các thiết lập khác gồm `LLM_TIMEOUT_SECONDS` mặc định `30`, `LLM_MAX_RETRIES` mặc định `2`, và có thể cấu hình qua `.env`.
+
+Mỗi request giới hạn mặc định tối đa `8.000` token đầu vào (`LLM_MAX_INPUT_TOKENS`) và `1.000` token đầu ra (`LLM_MAX_OUTPUT_TOKENS`). Đầu vào được đếm bằng LiteLLM theo model trước khi gửi; request vượt giới hạn bị từ chối. Giới hạn đầu ra được truyền tới provider và không thể bị ghi đè từ tùy chọn từng request.
+
+Tạo client với `LiteLLMClient.from_environment()` hoặc `LiteLLMClient.from_settings(settings)`. Gọi `complete(messages, ...)` hoặc `await acomplete(messages, ...)`; các tùy chọn riêng của model/provider có thể truyền tiếp dưới dạng keyword arguments. Ngoại lệ từ LiteLLM/provider được truyền lại để tầng gọi quyết định cách xử lý/fallback. `tenacity` được khai báo trực tiếp vì LiteLLM cần dependency này để thực hiện retry trong một số luồng lỗi.
