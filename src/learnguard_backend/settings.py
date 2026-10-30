@@ -68,7 +68,9 @@ class BackendSettings:
             raise ValueError("LLM_MAX_OUTPUT_TOKENS must be greater than zero.")
 
         return cls(
-            database_url=os.getenv("DATABASE_URL", ""),
+            database_url=(
+                os.getenv("DATABASE_URL") or os.getenv("LEARNGUARD_PG_DSN", "")
+            ),
             jwt_secret=os.getenv("JWT_SECRET", ""),
             llm_api_key=os.getenv("LLM_API_KEY") or None,
             llm_model=os.getenv("LLM_MODEL", ""),
@@ -82,6 +84,4 @@ class BackendSettings:
             llm_max_input_tokens=max_input_tokens,
             llm_max_output_tokens=max_output_tokens,
             ml_data_api_url=os.getenv("ML_DATA_API_URL", ""),
-            batch_dir=os.getenv("LEARNGUARD_BATCH_DIR", ""),
-            model_manifest_dir=os.getenv("LEARNGUARD_MODEL_MANIFEST_DIR", ""),
         )
