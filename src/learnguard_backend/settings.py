@@ -27,6 +27,8 @@ class BackendSettings:
     llm_max_input_tokens: int = 8000
     llm_max_output_tokens: int = 1000
     ml_data_api_url: str = ""
+    batch_dir: str = ""
+    model_manifest_dir: str = ""
 
     @classmethod
     def from_environment(cls) -> "BackendSettings":
@@ -80,4 +82,6 @@ class BackendSettings:
             llm_max_input_tokens=max_input_tokens,
             llm_max_output_tokens=max_output_tokens,
             ml_data_api_url=os.getenv("ML_DATA_API_URL", ""),
+            batch_dir=os.getenv("LEARNGUARD_BATCH_DIR", ""),
+            model_manifest_dir=os.getenv("LEARNGUARD_MODEL_MANIFEST_DIR", ""),
         )
