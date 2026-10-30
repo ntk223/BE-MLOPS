@@ -36,7 +36,11 @@ class HealthEndpointTests(unittest.TestCase):
         )
         body = TestClient(create_app(settings)).get("/health").json()
 
-        self.assertEqual(body["dependencies"]["database"], "configured")
+        # A database_url being set means the health check attempts a real
+        # ping: it reports reachable/unreachable, never not_configured.
+        self.assertIn(
+            body["dependencies"]["database"], ("reachable", "unreachable")
+        )
         self.assertEqual(body["dependencies"]["llm"], "configured")
 
 
