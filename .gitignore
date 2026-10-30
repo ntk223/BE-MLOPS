@@ -8,3 +8,7 @@ __pycache__/
 .coverage
 dist/
 build/
+.opencode
+.v-skills
+v-agent-debug.log
+*.egg-info/

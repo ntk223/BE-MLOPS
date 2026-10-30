@@ -1,7 +1,7 @@
 # Backend TODO
 
 - [ ] Chốt API contract version đầu tiên với frontend và ML/data batch.
-- [ ] Implement FastAPI app factory, health route và request validation.
+- [x] Implement FastAPI app factory, health route và request validation.
 - [ ] Implement login, JWT expiry, RBAC advisor/admin và bootstrap user policy.
 - [ ] Implement student list/detail và filter/sort/pagination.
 - [ ] Implement brief generate/read/edit-version/decision workflow.

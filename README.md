@@ -1,6 +1,6 @@
 # LearnGuard Backend
 
-Git repository riêng cho M6 API, M7 persistence, M8 advisor brief và phần audit/observability được gọi từ API. Các module hiện là contract/TODO, chưa chạy server.
+Git repository riêng cho M6 API, M7 persistence, M8 advisor brief và phần audit/observability được gọi từ API. FastAPI app factory và health route đã chạy được; các module nghiệp vụ còn là contract/TODO.
 
 ## Boundaries
 
@@ -12,13 +12,36 @@ Git repository riêng cho M6 API, M7 persistence, M8 advisor brief và phần au
 ## Module map
 
 - `src/learnguard_backend/api/`: app factory, controllers, auth và request/response DTO.
+- `src/learnguard_backend/main.py`: ASGI entrypoint cho uvicorn.
 - `src/learnguard_backend/db/`: records, repository interfaces và session contract.
 - `src/learnguard_backend/services/briefs.py`: brief generation/validation/fallback contract.
 - `src/learnguard_backend/services/llm.py`: client LLM dùng LiteLLM, hỗ trợ chat completion đồng bộ/bất đồng bộ và chuẩn hóa usage/cost/latency.
 - `src/learnguard_backend/observability.py`: audit, request metrics và run summary contracts.
 - `src/learnguard_backend/settings.py`: backend-only runtime configuration.
 
-Core methods đang để TODO/`NotImplementedError`. Xem `TODO.md` cho thứ tự triển khai. Chưa có Dockerfile hoặc Compose chạy được.
+Controllers nghiệp vụ (auth, predictions, briefs) đang để TODO/`NotImplementedError`. Xem `TODO.md` cho thứ tự triển khai. Chưa có Dockerfile hoặc Compose chạy được.
+
+Hợp đồng schema database giữa data pipeline và backend (ingest `prediction-batch.v1`, schema bảng, enums, chính sách PII) định nghĩa tại [`docs/DB_CONTRACT.md`](docs/DB_CONTRACT.md).
+
+## Chạy backend
+
+Cài package ở chế độ editable (một lần):
+
+```bash
+pip install -e .
+```
+
+Khởi chạy server:
+
+```bash
+uvicorn learnguard_backend.main:app --reload
+```
+
+Health check tại `http://127.0.0.1:8000/health`, tài liệu OpenAPI tự sinh tại `/docs`. Chạy bộ test:
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## LLM configuration
 
