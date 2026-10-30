@@ -27,6 +27,7 @@ class BackendSettings:
     llm_max_input_tokens: int = 8000
     llm_max_output_tokens: int = 1000
     ml_data_api_url: str = ""
+    cors_origins: str = ""
     batch_dir: str = ""
     model_manifest_dir: str = ""
 
@@ -84,4 +85,7 @@ class BackendSettings:
             llm_max_input_tokens=max_input_tokens,
             llm_max_output_tokens=max_output_tokens,
             ml_data_api_url=os.getenv("ML_DATA_API_URL", ""),
+            cors_origins=os.getenv(
+                "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+            ),
         )

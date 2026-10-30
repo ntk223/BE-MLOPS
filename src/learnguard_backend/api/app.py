@@ -9,6 +9,7 @@ import json
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
@@ -154,6 +155,21 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
         version=__version__,
     )
     app.state.settings = settings
+
+    # The advisor SPA (frontend repo, default Vite origin) calls this API
+    # cross-origin. Origins are configurable; "*" is deliberately not used.
+    allowed_origins = [
+        origin.strip()
+        for origin in settings.cors_origins.split(",")
+        if origin.strip()
+    ]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+        max_age=600,
+    )
 
     _session_factory: sessionmaker[Session] | None = None
     if settings.database_url:
