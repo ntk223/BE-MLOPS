@@ -6,6 +6,7 @@ DB_CONTRACT.md v1.0 rev2). Every prediction access is written to
 """
 
 import json
+from datetime import datetime, timezone
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query
@@ -19,16 +20,27 @@ from learnguard_backend.api.schemas import DecisionRequest, StudentListFilters
 from learnguard_backend.db.models import (
     AuditLogRecord,
     BriefRecord,
+    DecisionRecord,
+    LLMCallRecord,
     MLPredictionRecord,
     UserRecord,
 )
 from learnguard_backend.db.repository import (
     PredictionPage,
     SQLAuditLogRepository,
+    SQLBriefRepository,
+    SQLDecisionRepository,
+    SQLLLMCallRepository,
     SQLMLPredictionRepository,
+    SQLUserRepository,
 )
 from learnguard_backend.db.session import get_session_factory
 from learnguard_backend.db.entities import PREDICTION_STATUSES
+from learnguard_backend.services.briefs import (
+    STATUS_UNAVAILABLE,
+    AdvisorBriefService,
+    build_context,
+)
 from learnguard_backend.settings import BackendSettings
 
 API_TITLE = "LearnGuard Backend"
@@ -82,6 +94,44 @@ class PredictionPageOut(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class BriefGenerateRequest(BaseModel):
+    code_module: str = Field(min_length=1, max_length=8)
+    code_presentation: str = Field(min_length=1, max_length=8)
+    student_key: str = Field(min_length=1, max_length=16)
+
+
+class BriefReasonOut(BaseModel):
+    text: str
+    evidence_features: list[str] = Field(default_factory=list)
+
+
+class BriefOut(BaseModel):
+    brief_id: int
+    code_module: str
+    code_presentation: str
+    student_key: str
+    version: int
+    status: str  # generated | fallback_review | unavailable
+    summary: str
+    reasons: list[BriefReasonOut] = Field(default_factory=list)
+    support_suggestions: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    model_name: str | None = None
+    latency_ms: int | None = None
+    created_at: str | None = None
+    edited_at: str | None = None  # set after an advisor edit (content.edited_at)
+
+
+class BriefDecisionRequestBody(BaseModel):
+    decision: str  # accepted | rejected (validated in-route for a 400)
+
+
+class BriefDecisionOut(BaseModel):
+    brief_id: int
+    decision: str
+    decided_at: str
 
 
 class DependencyHealth(BaseModel):
@@ -164,11 +214,15 @@ def _to_out(record: MLPredictionRecord) -> PredictionOut:
     )
 
 
-def create_app(settings: BackendSettings | None = None) -> FastAPI:
+def create_app(
+    settings: BackendSettings | None = None, llm_service: Any = None
+) -> FastAPI:
     """Build the FastAPI application.
 
     Settings are loaded once at startup; an invalid configuration fails fast
     here instead of at request time. Pass an explicit ``settings`` in tests.
+    ``llm_service`` injects a (fake) LLM for tests; when omitted the shared
+    ``get_llm_service()`` is resolved lazily on first brief generation.
     """
     if settings is None:
         settings = BackendSettings.from_environment()
@@ -190,7 +244,7 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allowed_origins,
-        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type"],
         max_age=600,
     )
@@ -211,6 +265,33 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
             SQLMLPredictionRepository(_session_factory),
             SQLAuditLogRepository(_session_factory),
         )
+
+    def _brief_repositories() -> tuple[
+        SQLBriefRepository,
+        SQLDecisionRepository,
+        SQLLLMCallRepository,
+        SQLUserRepository,
+    ]:
+        if _session_factory is None:
+            raise HTTPException(
+                status_code=503,
+                detail="database_not_configured (set DATABASE_URL)",
+            )
+        return (
+            SQLBriefRepository(_session_factory),
+            SQLDecisionRepository(_session_factory),
+            SQLLLMCallRepository(_session_factory),
+            SQLUserRepository(_session_factory),
+        )
+
+    # M8: the brief service uses the shared LLM unless a test fake is
+    # injected. Without a configured LLM, generation degrades to
+    # ``unavailable`` instead of erroring.
+    brief_service = AdvisorBriefService(llm=llm_service)
+    llm_configured = (
+        llm_service is not None
+        or bool(settings.llm_api_key or settings.llm_fallback_model)
+    )
 
     @app.get(
         "/health",
@@ -355,20 +436,411 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
             offset=offset,
         )
 
+    @app.post(
+        "/briefs/generate",
+        response_model=BriefOut,
+        tags=["advisor"],
+        summary="Generate (or regenerate) an advisor brief for one prediction",
+    )
+    def generate_brief(body: BriefGenerateRequest) -> BriefOut:
+        prediction_repo, audit_repo = _repositories()
+        brief_repo, _, llm_call_repo, _ = _brief_repositories()
+        record = prediction_repo.get(
+            body.code_module, body.code_presentation, body.student_key
+        )
+        if record is None:
+            raise HTTPException(status_code=404, detail="prediction_not_found")
+
+        prediction_ref = (
+            f"{record.code_module}/{record.code_presentation}/{record.student_key}"
+        )
+        if llm_configured:
+            # Minimal PII-free context only (hashed student_key, aggregates).
+            result = brief_service.generate(prediction_ref, build_context(record))
+        else:
+            result = brief_service.make_fallback(
+                prediction_ref, "llm_not_configured", status=STATUS_UNAVAILABLE
+            )
+
+        content = _brief_content(result)
+        citations = _cited_evidence(result)
+        active = brief_repo.get_active(
+            record.code_module, record.code_presentation, record.student_key
+        )
+        if active is not None:
+            # Regenerate: version+1 on the same brief row (mock behaviour).
+            row = brief_repo.bump_version(
+                active.brief_id, active.version + 1, content, citations
+            )
+        else:
+            version = brief_repo.next_version(
+                record.code_module,
+                record.code_presentation,
+                record.student_key,
+            )
+            row = brief_repo.insert(
+                BriefRecord(
+                    brief_id=None,
+                    code_module=record.code_module,
+                    code_presentation=record.code_presentation,
+                    student_key=record.student_key,
+                    version=version,
+                    content=content,
+                    citations=citations,
+                    status="awaiting_review",
+                    created_by=None,
+                )
+            )
+
+        if llm_configured:
+            llm_call_repo.save(
+                LLMCallRecord(
+                    call_id=None,
+                    brief_id=row.brief_id,
+                    model=result.model_name
+                    or settings.llm_model
+                    or "unknown",
+                    latency_ms=result.latency_ms or 0,
+                    status=_llm_call_status(result),
+                    cost_usd=result.cost_usd,
+                    prompt_tokens=result.prompt_tokens,
+                    completion_tokens=result.completion_tokens,
+                )
+            )
+        audit_repo.append(
+            _audit_event(
+                action="brief_generate",
+                entity_id=str(row.brief_id),
+                entity="brief",
+                payload={
+                    "code_module": record.code_module,
+                    "code_presentation": record.code_presentation,
+                    "student_key": record.student_key,
+                    "version": row.version,
+                    "generation_status": result.status,
+                    "error_reason": result.error_reason,
+                },
+            )
+        )
+        return _to_brief_out(row)
+
+    @app.get(
+        "/briefs/{brief_id}",
+        response_model=BriefOut,
+        tags=["advisor"],
+        summary="One advisor brief by id",
+    )
+    def get_brief(brief_id: int) -> BriefOut:
+        brief_repo, _, _, _ = _brief_repositories()
+        row = brief_repo.get(brief_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="brief_not_found")
+        return _to_brief_out(row)
+
+    @app.put(
+        "/briefs/{brief_id}",
+        response_model=BriefOut,
+        tags=["advisor"],
+        summary=(
+            "Advisor edit of a brief's editable content (no version bump, "
+            "evidence citations untouched)"
+        ),
+    )
+    def edit_brief(brief_id: int, body: dict[str, Any]) -> BriefOut:
+        """Save advisor edits in place.
+
+        Version is NOT bumped (only regeneration creates a new version),
+        ``status`` and the persisted ``citations`` column are untouched.
+        The edit is recorded in ``content`` (edited_at/edited_by/source_history)
+        and in ``audit_logs`` (action ``brief_edit``).
+        """
+        brief_repo, _, _, user_repo = _brief_repositories()
+        _, audit_repo = _repositories()
+        row = brief_repo.get(brief_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="brief_not_found")
+
+        updates = _validated_brief_edits(body)
+        if not updates:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "empty_edit_payload (supply at least one of: summary, "
+                    "reasons, support_suggestions, limitations)"
+                ),
+            )
+
+        # TODO(M6 auth): replace the system principal with the authenticated
+        # advisor; audit_logs.user_id is NOT NULL so an actor is required.
+        user_id = user_repo.get_or_create_system_user()
+        content = dict(row.content or {})
+        content.update(updates)
+        edited_at = datetime.now(timezone.utc).isoformat()
+        content["edited_at"] = edited_at
+        content["edited_by"] = SQLUserRepository.SYSTEM_EMAIL
+        history = content.get("source_history")
+        history = (
+            [item for item in history if isinstance(item, str)]
+            if isinstance(history, list)
+            else []
+        )
+        if "advisor_edit" not in history:
+            history.append("advisor_edit")
+        content["source_history"] = history
+
+        updated = brief_repo.update_content(brief_id, content)
+        audit_repo.append(
+            _audit_event(
+                action="brief_edit",
+                entity_id=str(brief_id),
+                entity="brief",
+                user_id=user_id,
+                payload={
+                    "fields": sorted(updates),
+                    "edited_at": edited_at,
+                },
+            )
+        )
+        return _to_brief_out(updated)
+
+    @app.post(
+        "/briefs/{brief_id}/decision",
+        response_model=BriefDecisionOut,
+        tags=["advisor"],
+        summary="Record the advisor's accept/reject decision for a brief",
+    )
+    def decide_brief(brief_id: int, body: BriefDecisionRequestBody) -> BriefDecisionOut:
+        if body.decision not in ("accepted", "rejected"):
+            raise HTTPException(
+                status_code=400,
+                detail="invalid_decision (must be 'accepted' or 'rejected')",
+            )
+        brief_repo, decision_repo, _, user_repo = _brief_repositories()
+        _, audit_repo = _repositories()
+        row = brief_repo.get(brief_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="brief_not_found")
+
+        # TODO(M6 auth): replace the system principal with the authenticated
+        # advisor; decisions.user_id is NOT NULL so an actor is required.
+        user_id = user_repo.get_or_create_system_user()
+        action = "accept" if body.decision == "accepted" else "reject"
+        decision = decision_repo.save(
+            DecisionRecord(
+                decision_id=None,
+                brief_id=brief_id,
+                user_id=user_id,
+                action=action,
+                feedback=None,
+            )
+        )
+        brief_repo.set_status(brief_id, "accepted" if action == "accept" else "rejected")
+        audit_repo.append(
+            _audit_event(
+                action="brief_decision",
+                entity_id=str(brief_id),
+                entity="brief",
+                payload={"decision": body.decision, "action": action},
+            )
+        )
+        decided_at = decision.decided_at or datetime.now(timezone.utc)
+        return BriefDecisionOut(
+            brief_id=brief_id,
+            decision=body.decision,
+            decided_at=decided_at.isoformat(),
+        )
+
     return app
 
 
 def _audit_event(
-    action: str, entity_id: str | None, payload: dict[str, Any]
+    action: str,
+    entity_id: str | None,
+    payload: dict[str, Any],
+    entity: str = "ml_prediction",
+    user_id: int | None = None,
 ) -> AuditLogRecord:
     return AuditLogRecord(
         log_id=None,
-        user_id=None,  # TODO(M6 auth): fill from the authenticated principal
+        user_id=user_id,  # TODO(M6 auth): fill from the authenticated principal
         action=action,
-        entity="ml_prediction",
+        entity=entity,
         entity_id=entity_id,
         payload=payload,
     )
+
+
+def _brief_content(result: Any) -> dict[str, Any]:
+    """Serialize a BriefGenerationResult into the briefs.content JSONB."""
+    draft = result.draft
+    return {
+        "summary": draft.summary if draft else "",
+        "reasons": [
+            {
+                "text": reason.text,
+                "evidence_features": list(reason.evidence_features),
+            }
+            for reason in (draft.reasons if draft else [])
+        ],
+        "support_suggestions": (
+            list(draft.support_template_ids) if draft else []
+        ),
+        "limitations": list(draft.limitations) if draft else [],
+        "generation_status": result.status,
+        "model_name": result.model_name,
+        "latency_ms": result.latency_ms,
+        "error_reason": result.error_reason,
+        # Fresh LLM content replaces any previous advisor edit: the new
+        # version has not been edited yet and starts with a clean history.
+        "edited_at": None,
+        "source_history": [],
+    }
+
+
+def _cited_evidence(result: Any) -> list[dict[str, Any]]:
+    """Only evidence actually cited by a (grounded) reason is persisted."""
+    if result.draft is None:
+        return []
+    cited = {
+        name
+        for reason in result.draft.reasons
+        for name in reason.evidence_features
+    }
+    return [
+        {
+            "feature_name": evidence.feature_name,
+            "observed_value": evidence.observed_value,
+            "contribution": evidence.contribution,
+        }
+        for evidence in result.draft.evidence
+        if evidence.feature_name in cited
+    ]
+
+
+def _llm_call_status(result: Any) -> str:
+    """Map a generation result to the llm_calls.status enum."""
+    if result.status == "generated":
+        return "ok"
+    if result.error_reason and result.error_reason.startswith("llm_error"):
+        return "api_error"
+    return "validation_failed"
+
+
+def _to_brief_out(record: BriefRecord) -> BriefOut:
+    content = record.content or {}
+    reasons: list[BriefReasonOut] = []
+    for item in content.get("reasons") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+            continue
+        features = item.get("evidence_features")
+        reasons.append(
+            BriefReasonOut(
+                text=item["text"],
+                evidence_features=[
+                    name
+                    for name in (features if isinstance(features, list) else [])
+                    if isinstance(name, str)
+                ],
+            )
+        )
+    created_at = record.created_at
+    raw_edited_at = content.get("edited_at")
+    return BriefOut(
+        brief_id=record.brief_id,
+        code_module=record.code_module,
+        code_presentation=record.code_presentation,
+        student_key=record.student_key,
+        version=record.version,
+        status=str(content.get("generation_status") or STATUS_UNAVAILABLE),
+        summary=str(content.get("summary") or ""),
+        reasons=reasons,
+        support_suggestions=[
+            item
+            for item in (content.get("support_suggestions") or [])
+            if isinstance(item, str)
+        ],
+        limitations=[
+            item
+            for item in (content.get("limitations") or [])
+            if isinstance(item, str)
+        ],
+        model_name=(
+            content.get("model_name")
+            if isinstance(content.get("model_name"), str)
+            else None
+        ),
+        latency_ms=(
+            content.get("latency_ms")
+            if isinstance(content.get("latency_ms"), int)
+            else None
+        ),
+        created_at=created_at.isoformat() if created_at else None,
+        edited_at=raw_edited_at if isinstance(raw_edited_at, str) else None,
+    )
+
+
+def _validated_brief_edits(body: dict[str, Any]) -> dict[str, Any]:
+    """Keep only the four editable brief fields and validate their shapes.
+
+    Unknown keys (``brief_id``/``student_key``/``code_module``/...) are
+    deliberately ignored — identity fields can never be edited. Raises 400
+    when a present editable field has the wrong shape; returns ``{}`` when
+    no editable field was supplied at all.
+    """
+    errors: list[str] = []
+    updates: dict[str, Any] = {}
+
+    if "summary" in body:
+        summary = body["summary"]
+        if not isinstance(summary, str) or not summary.strip():
+            errors.append("summary must be a non-empty string")
+        else:
+            updates["summary"] = summary
+
+    if "reasons" in body:
+        raw_reasons = body["reasons"]
+        if not isinstance(raw_reasons, list):
+            errors.append("reasons must be a list of {text, evidence_features}")
+        elif any(
+            not isinstance(item, dict) or not isinstance(item.get("text"), str)
+            for item in raw_reasons
+        ):
+            errors.append(
+                "reasons must be a list of {text, evidence_features}"
+            )
+        else:
+            updates["reasons"] = [
+                {
+                    "text": item["text"],
+                    "evidence_features": [
+                        name
+                        for name in (
+                            item.get("evidence_features")
+                            if isinstance(item.get("evidence_features"), list)
+                            else []
+                        )
+                        if isinstance(name, str)
+                    ],
+                }
+                for item in raw_reasons
+            ]
+
+    for key in ("support_suggestions", "limitations"):
+        if key in body:
+            raw_items = body[key]
+            if not isinstance(raw_items, list):
+                errors.append(f"{key} must be a list of strings")
+            else:
+                updates[key] = [
+                    item for item in raw_items if isinstance(item, str)
+                ]
+
+    if errors:
+        raise HTTPException(
+            status_code=400,
+            detail="invalid_edit_payload: " + "; ".join(errors),
+        )
+    return updates
 
 
 class AuthenticationController:

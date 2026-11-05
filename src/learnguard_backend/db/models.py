@@ -55,6 +55,7 @@ class BriefRecord:
     citations: list[dict[str, Any]] = field(default_factory=list)
     status: str = "awaiting_review"
     created_by: int | None = None
+    created_at: datetime | None = None
 
 
 @dataclass
@@ -64,6 +65,7 @@ class DecisionRecord:
     user_id: int
     action: str  # accept | reject | edit
     feedback: str | None = None
+    decided_at: datetime | None = None
 
 
 @dataclass
@@ -74,6 +76,8 @@ class LLMCallRecord:
     latency_ms: int
     status: str
     cost_usd: float | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
 
 
 @dataclass

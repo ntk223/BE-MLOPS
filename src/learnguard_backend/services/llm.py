@@ -351,6 +351,11 @@ class LLMService:
     def __init__(self, client: LiteLLMClient) -> None:
         self._client = client
 
+    @property
+    def model_name(self) -> str:
+        """Primary model name (used for call attribution even on failure)."""
+        return self._client.model
+
     def complete(
         self,
         messages: Sequence[Mapping[str, Any]],
