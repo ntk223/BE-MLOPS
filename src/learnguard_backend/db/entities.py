@@ -80,6 +80,7 @@ class MLPrediction(Base):
     snapshot_version: Mapped[str] = mapped_column(String(128), nullable=False)
     cutoff_day: Mapped[int] = mapped_column(INTEGER, nullable=False)
     top_signals_json: Mapped[str | None] = mapped_column(Text)
+    features_json: Mapped[str | None] = mapped_column(Text)
     run_id: Mapped[str] = mapped_column(String(128), nullable=False)
     scored_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False

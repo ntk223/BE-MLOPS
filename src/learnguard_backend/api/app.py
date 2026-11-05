@@ -71,6 +71,8 @@ class PredictionOut(BaseModel):
     snapshot_version: str
     cutoff_day: int
     top_signals: list[SignalOut] = Field(default_factory=list)
+    # Thống kê hành vi/học thuật GỐC của SV tại cutoff (features_json trong DB).
+    features: dict[str, float | None] = Field(default_factory=dict)
     run_id: str
     scored_at: Any = None
 
@@ -119,6 +121,27 @@ def _parse_top_signals(raw: str | None) -> list[SignalOut]:
     return parsed
 
 
+def _parse_features(raw: str | None) -> dict[str, float | None]:
+    """Parse ``features_json`` defensively — never crash serialization."""
+    if not raw:
+        return {}
+    try:
+        features = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(features, dict):
+        return {}
+    parsed: dict[str, float | None] = {}
+    for name, value in features.items():
+        if not isinstance(name, str):
+            continue
+        if value is None:
+            parsed[name] = None
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            parsed[name] = float(value)
+    return parsed
+
+
 def _to_out(record: MLPredictionRecord) -> PredictionOut:
     return PredictionOut(
         code_module=record.code_module,
@@ -135,6 +158,7 @@ def _to_out(record: MLPredictionRecord) -> PredictionOut:
         snapshot_version=record.snapshot_version,
         cutoff_day=record.cutoff_day,
         top_signals=_parse_top_signals(record.top_signals_json),
+        features=_parse_features(record.features_json),
         run_id=record.run_id,
         scored_at=record.scored_at.isoformat() if record.scored_at else None,
     )

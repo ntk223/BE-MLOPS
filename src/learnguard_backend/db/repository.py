@@ -83,6 +83,7 @@ class SQLMLPredictionRepository:
             snapshot_version=row.snapshot_version,
             cutoff_day=row.cutoff_day,
             top_signals_json=row.top_signals_json,
+            features_json=row.features_json,
             run_id=row.run_id,
             scored_at=row.scored_at,
         )

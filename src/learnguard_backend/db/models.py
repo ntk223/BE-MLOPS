@@ -40,6 +40,8 @@ class MLPredictionRecord:
     top_signals_json: str | None
     run_id: str
     scored_at: datetime | None = None
+    # features_json mặc định None — DB cũ trước migration chưa có cột này.
+    features_json: str | None = None
 
 
 @dataclass
