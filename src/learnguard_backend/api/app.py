@@ -6,7 +6,9 @@ DB_CONTRACT.md v1.0 rev2). Every prediction access is written to
 """
 
 import json
+import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query
@@ -57,6 +59,13 @@ UNREACHABLE = "unreachable"
 
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 500
+
+EVALUATIONS_DEFAULT_LIMIT = 20
+EVALUATIONS_MAX_LIMIT = 100
+EVAL_REPORT_SCHEMA = "eval-report.v1"
+# run_id is a single directory name: no separators, no leading dot — this
+# blocks path traversal out of EVALUATIONS_DIR at the validation layer.
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 # --- Response models (None-safe: predicted_label may be NULL) -----------------
@@ -146,6 +155,27 @@ class HealthResponse(BaseModel):
     dependencies: DependencyHealth
 
 
+class EvaluationRunSummaryOut(BaseModel):
+    run_id: str
+    created_at: str | None = None
+    subjects: list[str] = Field(default_factory=list)
+    combined_summary: dict[str, int] = Field(default_factory=dict)
+    overall_status: str  # pass | warn | fail
+    reports_available: list[str] = Field(default_factory=list)
+
+
+class EvaluationListOut(BaseModel):
+    runs: list[EvaluationRunSummaryOut]
+    total: int
+    limit: int
+
+
+class EvaluationDetailOut(BaseModel):
+    run_id: str
+    created_at: str | None = None
+    reports: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
 def _parse_top_signals(raw: str | None) -> list[SignalOut]:
     """Parse ``top_signals_json`` defensively — never crash serialization."""
     if not raw:
@@ -190,6 +220,115 @@ def _parse_features(raw: str | None) -> dict[str, float | None]:
         elif isinstance(value, (int, float)) and not isinstance(value, bool):
             parsed[name] = float(value)
     return parsed
+
+
+def _read_json_dict(path: Path) -> dict[str, Any] | None:
+    """Read a JSON file defensively — ``None`` for missing/corrupt/non-dict."""
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _is_valid_run_id(run_id: str) -> bool:
+    """Only ``[A-Za-z0-9._-]``, no leading dot — blocks path traversal."""
+    return bool(run_id) and not run_id.startswith(".") and bool(
+        _RUN_ID_RE.fullmatch(run_id)
+    )
+
+
+def _load_manifest(run_dir: Path) -> dict[str, Any] | None:
+    """Return a valid eval-report manifest or ``None`` (run is skipped)."""
+    manifest = _read_json_dict(run_dir / "manifest.json")
+    if manifest is None or manifest.get("schema_version") != EVAL_REPORT_SCHEMA:
+        return None
+    if not isinstance(manifest.get("run_id"), str) or not manifest["run_id"]:
+        return None
+    return manifest
+
+
+def _load_scorecard(path: Path) -> dict[str, Any] | None:
+    """Return a scorecard dict (with a string ``subject``) or ``None``."""
+    card = _read_json_dict(path)
+    if card is None or not isinstance(card.get("subject"), str):
+        return None
+    return card
+
+
+def _combined_summary(scorecards: list[dict[str, Any]]) -> dict[str, int]:
+    """Sum the per-scorecard summaries into one combined tally."""
+    keys = ("total", "pass", "warn", "fail", "skipped")
+    combined = dict.fromkeys(keys, 0)
+    for card in scorecards:
+        summary = card.get("summary")
+        summary = summary if isinstance(summary, dict) else {}
+        for key in keys:
+            value = summary.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                combined[key] += value
+    return combined
+
+
+def _overall_status(summary: dict[str, int]) -> str:
+    """fail if any check failed, warn if any warned, otherwise pass."""
+    if summary.get("fail", 0) > 0:
+        return "fail"
+    if summary.get("warn", 0) > 0:
+        return "warn"
+    return "pass"
+
+
+def _scan_runs(root: Path) -> list[dict[str, Any]]:
+    """Scan ``root`` for valid evaluation runs (corrupt subdirs are skipped).
+
+    Never raises for a missing/unreadable root: the caller decides whether
+    that is a 404/empty-list situation, not a crash.
+    """
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return []
+    runs: list[dict[str, Any]] = []
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        manifest = _load_manifest(entry)
+        if manifest is None:
+            continue
+        scorecards: list[dict[str, Any]] = []
+        available: list[str] = []
+        try:
+            report_paths = sorted(entry.glob("eval_*.json"))
+        except OSError:
+            report_paths = []
+        for path in report_paths:
+            card = _load_scorecard(path)
+            if card is not None:
+                scorecards.append(card)
+                available.append(path.name)
+        subjects = manifest.get("subjects")
+        if not isinstance(subjects, list):
+            subjects = [
+                card["subject"] for card in scorecards
+            ]
+        subjects = [s for s in subjects if isinstance(s, str)]
+        summary = _combined_summary(scorecards)
+        created_at = manifest.get("created_at")
+        runs.append(
+            {
+                "run_id": manifest["run_id"],
+                "created_at": (
+                    created_at if isinstance(created_at, str) else None
+                ),
+                "subjects": subjects,
+                "combined_summary": summary,
+                "overall_status": _overall_status(summary),
+                "reports_available": available,
+            }
+        )
+    return runs
 
 
 def _to_out(record: MLPredictionRecord) -> PredictionOut:
@@ -293,6 +432,34 @@ def create_app(
         or bool(settings.llm_api_key or settings.llm_fallback_model)
     )
 
+    def _audit_evaluation(
+        action: str, entity_id: str | None, payload: dict[str, Any]
+    ) -> None:
+        """Best-effort audit for the read-only evaluation endpoints.
+
+        EVALUATIONS_DIR is filesystem-only, so /evaluations works without a
+        database; when no DB is configured the audit entry is skipped
+        instead of failing the request.
+        """
+        if _session_factory is None:
+            return
+        SQLAuditLogRepository(_session_factory).append(
+            _audit_event(
+                action=action,
+                entity_id=entity_id,
+                entity="evaluation",
+                payload=payload,
+            )
+        )
+
+    def _evaluations_root() -> Path:
+        if not settings.evaluations_dir:
+            raise HTTPException(
+                status_code=503,
+                detail="evaluations_dir_not_configured (set EVALUATIONS_DIR)",
+            )
+        return Path(settings.evaluations_dir)
+
     @app.get(
         "/health",
         response_model=HealthResponse,
@@ -319,6 +486,73 @@ def create_app(
                     else NOT_CONFIGURED
                 ),
             ),
+        )
+
+    @app.get(
+        "/evaluations",
+        response_model=EvaluationListOut,
+        tags=["evaluations"],
+        summary="List published evaluation runs (read-only scorecards)",
+    )
+    def list_evaluations(
+        limit: Annotated[
+            int, Query(ge=1, le=EVALUATIONS_MAX_LIMIT)
+        ] = EVALUATIONS_DEFAULT_LIMIT,
+    ) -> EvaluationListOut:
+        root = _evaluations_root()
+        runs = _scan_runs(root)
+        runs.sort(
+            key=lambda run: run["created_at"] or "", reverse=True
+        )
+        _audit_evaluation(
+            action="evaluation_list",
+            entity_id=None,
+            payload={
+                "limit": limit,
+                "total": len(runs),
+                "returned": min(len(runs), limit),
+            },
+        )
+        return EvaluationListOut(
+            runs=[EvaluationRunSummaryOut(**run) for run in runs[:limit]],
+            total=len(runs),
+            limit=limit,
+        )
+
+    @app.get(
+        "/evaluations/{run_id}",
+        response_model=EvaluationDetailOut,
+        tags=["evaluations"],
+        summary="Full scorecards for one evaluation run, keyed by subject",
+    )
+    def get_evaluation(run_id: str) -> EvaluationDetailOut:
+        if not _is_valid_run_id(run_id):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "invalid_run_id (only [A-Za-z0-9._-], no leading dot)"
+                ),
+            )
+        run_dir = _evaluations_root() / run_id
+        manifest = _load_manifest(run_dir)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail="evaluation_not_found")
+        reports: dict[str, dict[str, Any]] = {}
+        for path in sorted(run_dir.glob("eval_*.json")):
+            card = _load_scorecard(path)
+            if card is not None:
+                subject = card["subject"]
+                reports[subject] = card
+        _audit_evaluation(
+            action="evaluation_read",
+            entity_id=run_id,
+            payload={"subjects": sorted(reports)},
+        )
+        created_at = manifest.get("created_at")
+        return EvaluationDetailOut(
+            run_id=str(manifest["run_id"]),
+            created_at=created_at if isinstance(created_at, str) else None,
+            reports=reports,
         )
 
     @app.get(

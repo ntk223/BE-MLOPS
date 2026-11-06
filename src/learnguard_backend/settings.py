@@ -30,6 +30,9 @@ class BackendSettings:
     cors_origins: str = ""
     batch_dir: str = ""
     model_manifest_dir: str = ""
+    # Published evaluation scorecards (written by the ml-data pipeline,
+    # read-only here). Empty disables the /evaluations endpoints.
+    evaluations_dir: str = ""
 
     @classmethod
     def from_environment(cls) -> "BackendSettings":
@@ -88,4 +91,5 @@ class BackendSettings:
             cors_origins=os.getenv(
                 "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
             ),
+            evaluations_dir=os.getenv("EVALUATIONS_DIR", ""),
         )
