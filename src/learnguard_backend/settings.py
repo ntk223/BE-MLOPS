@@ -33,6 +33,19 @@ class BackendSettings:
     # Published evaluation scorecards (written by the ml-data pipeline,
     # read-only here). Empty disables the /evaluations endpoints.
     evaluations_dir: str = ""
+    # UI-triggered evaluation runs (POST /evaluations/run): the ml-data repo
+    # that owns the ``learnguard evaluate all`` CLI. Empty disables the
+    # trigger endpoint. All eval paths are relative to ``ml_repo_dir``.
+    ml_repo_dir: str = ""
+    ml_eval_learnguard_bin: str = ".venv/bin/learnguard"
+    ml_eval_model_dir: str = ""
+    ml_eval_preprocessing_dir: str = ""
+    # Empty falls back to the backend DATABASE_URL for the CLI --pg-dsn.
+    ml_eval_pg_dsn: str = ""
+    eval_judge_sample: int = 4
+    # Raw OULAD CSV dataset (studentInfo.csv, studentVle.csv, ...) read by
+    # GET /predictions/.../activity. Empty -> 503 oulad_data_not_configured.
+    oulad_data_dir: str = ""
 
     @classmethod
     def from_environment(cls) -> "BackendSettings":
@@ -71,6 +84,11 @@ class BackendSettings:
         if max_output_tokens <= 0:
             raise ValueError("LLM_MAX_OUTPUT_TOKENS must be greater than zero.")
 
+        try:
+            judge_sample = int(os.getenv("EVAL_JUDGE_SAMPLE", "4"))
+        except ValueError as exc:
+            raise ValueError("EVAL_JUDGE_SAMPLE must be an integer.") from exc
+
         return cls(
             database_url=(
                 os.getenv("DATABASE_URL") or os.getenv("LEARNGUARD_PG_DSN", "")
@@ -92,4 +110,15 @@ class BackendSettings:
                 "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
             ),
             evaluations_dir=os.getenv("EVALUATIONS_DIR", ""),
+            ml_repo_dir=os.getenv("ML_REPO_DIR", ""),
+            ml_eval_learnguard_bin=os.getenv(
+                "ML_EVAL_LEARNGUARD_BIN", ".venv/bin/learnguard"
+            ),
+            ml_eval_model_dir=os.getenv("ML_EVAL_MODEL_DIR", ""),
+            ml_eval_preprocessing_dir=os.getenv(
+                "ML_EVAL_PREPROCESSING_DIR", ""
+            ),
+            ml_eval_pg_dsn=os.getenv("ML_EVAL_PG_DSN", ""),
+            eval_judge_sample=judge_sample,
+            oulad_data_dir=os.getenv("OULAD_DATA_DIR", ""),
         )

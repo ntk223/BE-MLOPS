@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from learnguard_backend.db.entities import (
@@ -22,6 +22,7 @@ from learnguard_backend.db.entities import (
     User,
 )
 from learnguard_backend.db.models import (
+    AuditLogEntry,
     AuditLogRecord,
     BriefRecord,
     DecisionRecord,
@@ -36,6 +37,30 @@ class PredictionPage:
     total: int
     limit: int
     offset: int
+
+
+@dataclass(frozen=True)
+class PredictionStats:
+    """Aggregate counts for the dashboard stat cards.
+
+    ``flagged_total`` respects every filter (including ``status``);
+    the per-status counts and ``above_threshold`` deliberately ignore the
+    ``status`` parameter so the UI always receives all four card numbers.
+    """
+
+    flagged_total: int
+    scored: int
+    insufficient_data: int
+    manual_review: int
+    no_prediction: int
+    above_threshold: int
+
+
+@dataclass(frozen=True)
+class AuditLogPage:
+    items: list[AuditLogEntry]
+    total: int
+    limit: int
 
 
 class MLPredictionRepository(Protocol):
@@ -56,6 +81,15 @@ class MLPredictionRepository(Protocol):
         limit: int = 50,
         offset: int = 0,
     ) -> PredictionPage: ...
+
+    def stats(
+        self,
+        *,
+        status: str | None = None,
+        code_module: str | None = None,
+        code_presentation: str | None = None,
+        threshold: float = 0.6,
+    ) -> PredictionStats: ...
 
 
 _ORDER_COLUMNS = {
@@ -140,12 +174,25 @@ class SQLMLPredictionRepository:
             statement = statement.where(MLPrediction.student_key == student_key)
         count_statement = select(func.count()).select_from(statement.subquery())
 
-        # NULLs last so incomplete rows never bury scored ones.
-        statement = (
-            statement.order_by(column.desc().nulls_last(), MLPrediction.student_key)
-            .limit(limit)
-            .offset(offset)
-        )
+        # Tiered trust ranking cho risk_score: scored (điểm có bằng chứng
+        # SHAP thật) trước, rồi manual_review (uncertainty cao), cuối cùng
+        # insufficient_data (điểm ngoại suy trên dữ liệu impute — không có
+        # tín hiệu hành vi để giải thích, không dẫn dắt hàng đợi). NULLs
+        # last để dòng chưa chấm không chen lên.
+        if order_by == "risk_score":
+            trust_tier = case(
+                (MLPrediction.status == "scored", 0),
+                (MLPrediction.status == "manual_review", 1),
+                else_=2,
+            )
+            statement = statement.order_by(
+                trust_tier.asc(), column.desc().nulls_last(), MLPrediction.student_key
+            )
+        else:
+            statement = (
+                statement.order_by(column.desc().nulls_last(), MLPrediction.student_key)
+            )
+        statement = statement.limit(limit).offset(offset)
 
         with self._session_factory() as session:
             total = session.execute(count_statement).scalar_one()
@@ -155,6 +202,85 @@ class SQLMLPredictionRepository:
                 total=total,
                 limit=limit,
                 offset=offset,
+            )
+
+    def stats(
+        self,
+        *,
+        status: str | None = None,
+        code_module: str | None = None,
+        code_presentation: str | None = None,
+        threshold: float = 0.6,
+    ) -> PredictionStats:
+        """Aggregate counts for the dashboard stat cards (no pagination).
+
+        ``flagged_total`` counts every prediction matching ALL filters —
+        when ``status`` is given it is the count of that status only
+        ("total after filters"). The four per-status counts and
+        ``above_threshold`` respect ``code_module``/``code_presentation``
+        but deliberately IGNORE the ``status`` parameter: the frontend
+        always needs all four numbers to render its four cards.
+        ``above_threshold`` counts ``status='scored'`` rows whose
+        ``risk_score`` is >= ``threshold`` (frontend: "vượt ngưỡng 60%").
+        """
+        if status is not None and status not in PREDICTION_STATUSES:
+            raise ValueError(
+                f"status must be one of {PREDICTION_STATUSES}, got '{status}'"
+            )
+
+        # Filters shared by every aggregate below.
+        scope_filters = []
+        if code_module is not None:
+            scope_filters.append(MLPrediction.code_module == code_module)
+        if code_presentation is not None:
+            scope_filters.append(
+                MLPrediction.code_presentation == code_presentation
+            )
+
+        # flagged_total: applies the status filter as well (after filters).
+        flagged_statement = select(MLPrediction)
+        if status is not None:
+            flagged_statement = flagged_statement.where(
+                MLPrediction.status == status
+            )
+        for condition in scope_filters:
+            flagged_statement = flagged_statement.where(condition)
+        flagged_count = select(func.count()).select_from(
+            flagged_statement.subquery()
+        )
+
+        # Per-status tally: module/presentation filters only — no status.
+        status_statement = (
+            select(MLPrediction.status, func.count())
+            .where(*scope_filters)
+            .group_by(MLPrediction.status)
+        )
+
+        # above_threshold: scored rows at/above the risk alert threshold
+        # (module/presentation filters only — no status, same as the cards).
+        above_statement = select(func.count()).select_from(
+            select(MLPrediction)
+            .where(
+                MLPrediction.status == "scored",
+                MLPrediction.risk_score >= threshold,
+                *scope_filters,
+            )
+            .subquery()
+        )
+
+        with self._session_factory() as session:
+            flagged_total = session.execute(flagged_count).scalar_one()
+            counts = dict(
+                session.execute(status_statement).all()
+            )
+            above_threshold = session.execute(above_statement).scalar_one()
+            return PredictionStats(
+                flagged_total=flagged_total,
+                scored=counts.get("scored", 0),
+                insufficient_data=counts.get("insufficient_data", 0),
+                manual_review=counts.get("manual_review", 0),
+                no_prediction=counts.get("no_prediction", 0),
+                above_threshold=above_threshold,
             )
 
 
@@ -167,7 +293,8 @@ class AuditLogRepository(Protocol):
 
 
 class SQLAuditLogRepository:
-    """Append-only audit writer (DB_CONTRACT.md §6.7)."""
+    """Append-only audit writer (DB_CONTRACT.md §6.7) with a read side
+    for the admin system journal (reading is NOT audited — no noise)."""
 
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._session_factory = session_factory
@@ -184,6 +311,79 @@ class SQLAuditLogRepository:
                         payload=event.payload,
                     )
                 )
+
+    @staticmethod
+    def _to_entry(
+        row: tuple[AuditLog, str | None, str | None],
+    ) -> AuditLogEntry:
+        log, actor_email, actor_name = row
+        return AuditLogEntry(
+            log_id=log.log_id,
+            at=log.at,
+            user_id=log.user_id,
+            actor_email=actor_email,
+            actor_name=actor_name,
+            action=log.action,
+            entity=log.entity,
+            entity_id=log.entity_id,
+            payload=log.payload or {},
+        )
+
+    def list_logs(
+        self,
+        *,
+        limit: int = 50,
+        action: str | None = None,
+        entity: str | None = None,
+    ) -> AuditLogPage:
+        """Newest-first page of audit logs; ``total`` counts every row
+        matching the exact ``action``/``entity`` filters (no limit)."""
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        statement = (
+            select(AuditLog, User.email, User.full_name)
+            .outerjoin(User, AuditLog.user_id == User.user_id)
+        )
+        if action is not None:
+            statement = statement.where(AuditLog.action == action)
+        if entity is not None:
+            statement = statement.where(AuditLog.entity == entity)
+        count_statement = select(func.count()).select_from(
+            statement.subquery()
+        )
+        # log_id as the tie-breaker so rows sharing the same ``at``
+        # timestamp keep a stable, insertion-consistent order.
+        statement = (
+            statement.order_by(AuditLog.at.desc(), AuditLog.log_id.desc())
+            .limit(limit)
+        )
+
+        with self._session_factory() as session:
+            total = session.execute(count_statement).scalar_one()
+            rows: Sequence[tuple[AuditLog, str | None, str | None]] = (
+                session.execute(statement).all()
+            )
+            return AuditLogPage(
+                items=[self._to_entry(row) for row in rows],
+                total=total,
+                limit=limit,
+            )
+
+    def distinct_actions(self) -> list[str]:
+        with self._session_factory() as session:
+            return list(
+                session.execute(
+                    select(AuditLog.action).distinct().order_by(AuditLog.action)
+                ).scalars()
+            )
+
+    def distinct_entities(self) -> list[str]:
+        with self._session_factory() as session:
+            return list(
+                session.execute(
+                    select(AuditLog.entity).distinct().order_by(AuditLog.entity)
+                ).scalars()
+            )
 
 
 class SQLDecisionRepository:

@@ -18,8 +18,10 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
 from learnguard_backend import __version__
+from learnguard_backend.api import eval_runner
 from learnguard_backend.api.schemas import DecisionRequest, StudentListFilters
 from learnguard_backend.db.models import (
+    AuditLogEntry,
     AuditLogRecord,
     BriefRecord,
     DecisionRecord,
@@ -29,6 +31,7 @@ from learnguard_backend.db.models import (
 )
 from learnguard_backend.db.repository import (
     PredictionPage,
+    PredictionStats,
     SQLAuditLogRepository,
     SQLBriefRepository,
     SQLDecisionRepository,
@@ -42,6 +45,11 @@ from learnguard_backend.services.briefs import (
     STATUS_UNAVAILABLE,
     AdvisorBriefService,
     build_context,
+)
+from learnguard_backend.services.student_activity import (
+    STUDENT_ACTIVITY_CUTOFF_DAY,
+    build_student_activity,
+    resolve_student_id,
 )
 from learnguard_backend.settings import BackendSettings
 
@@ -60,9 +68,17 @@ UNREACHABLE = "unreachable"
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 500
 
+# Risk alert threshold for /predictions/stats: a scored prediction counts
+# as "above_threshold" at risk_score >= 0.6 — matches the frontend note
+# "vượt ngưỡng 60%".
+RISK_ALERT_THRESHOLD = 0.6
+
 EVALUATIONS_DEFAULT_LIMIT = 20
 EVALUATIONS_MAX_LIMIT = 100
 EVAL_REPORT_SCHEMA = "eval-report.v1"
+
+AUDIT_LOGS_DEFAULT_LIMIT = 50
+AUDIT_LOGS_MAX_LIMIT = 200
 # run_id is a single directory name: no separators, no leading dot — this
 # blocks path traversal out of EVALUATIONS_DIR at the validation layer.
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -103,6 +119,49 @@ class PredictionPageOut(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class ActivityWeekOut(BaseModel):
+    label: str
+    from_day: int
+    to_day: int
+    clicks: int
+    days_active: int
+
+
+class ActivitySubmissionOut(BaseModel):
+    assessment_type: str
+    assessment_day: int
+    submitted_day: int | None = None
+    score: int | None = None
+    weight: int | None = None
+    status: str  # submitted | not_submitted
+
+
+class ActivityCategoryOut(BaseModel):
+    category: str
+    clicks: int
+
+
+class PredictionActivityOut(BaseModel):
+    # Raw OULAD behaviour stats for one student up to the day-27 cutoff
+    # (matches ml-data CUTOFF_DAY) — rendered by the Student Profile cards.
+    cutoff_day: int
+    weeks: list[ActivityWeekOut] = Field(default_factory=list)
+    submissions: list[ActivitySubmissionOut] = Field(default_factory=list)
+    activity_breakdown: list[ActivityCategoryOut] = Field(default_factory=list)
+
+
+class PredictionStatsOut(BaseModel):
+    # flagged_total = count after ALL filters (incl. status); the four
+    # per-status counts ignore the status param so the 4 cards always
+    # render; above_threshold = scored rows with risk_score >= 0.6.
+    flagged_total: int
+    scored: int
+    insufficient_data: int
+    manual_review: int
+    no_prediction: int
+    above_threshold: int
 
 
 class BriefGenerateRequest(BaseModel):
@@ -174,6 +233,40 @@ class EvaluationDetailOut(BaseModel):
     run_id: str
     created_at: str | None = None
     reports: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
+class EvaluationRunStartedOut(BaseModel):
+    run_id: str
+    status: str  # "started"
+
+
+class EvaluationRunStatusOut(BaseModel):
+    status: str  # idle | running | done | error
+    run_id: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    error: str | None = None
+    summary: dict[str, int] | None = None
+
+
+class AuditLogOut(BaseModel):
+    log_id: int
+    at: str | None = None
+    user_id: int | None = None
+    actor_email: str | None = None
+    actor_name: str | None = None
+    action: str
+    entity: str
+    entity_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class AuditLogListOut(BaseModel):
+    logs: list[AuditLogOut]
+    total: int
+    limit: int
+    actions: list[str] = Field(default_factory=list)
+    entities: list[str] = Field(default_factory=list)
 
 
 def _parse_top_signals(raw: str | None) -> list[SignalOut]:
@@ -460,6 +553,22 @@ def create_app(
             )
         return Path(settings.evaluations_dir)
 
+    def _oulad_data_dir() -> Path:
+        """Raw OULAD CSV dir for /predictions/.../activity (503 when unset
+        or the directory does not exist)."""
+        if not settings.oulad_data_dir:
+            raise HTTPException(
+                status_code=503,
+                detail="oulad_data_not_configured (set OULAD_DATA_DIR)",
+            )
+        data_dir = Path(settings.oulad_data_dir)
+        if not data_dir.is_dir():
+            raise HTTPException(
+                status_code=503,
+                detail="oulad_data_not_configured (directory not found)",
+            )
+        return data_dir
+
     @app.get(
         "/health",
         response_model=HealthResponse,
@@ -518,6 +627,51 @@ def create_app(
             total=len(runs),
             limit=limit,
         )
+
+    @app.post(
+        "/evaluations/run",
+        response_model=EvaluationRunStartedOut,
+        status_code=202,
+        tags=["evaluations"],
+        summary="Trigger one ml-data evaluation run in the background",
+    )
+    def run_evaluation() -> EvaluationRunStartedOut:
+        _evaluations_root()  # 503 evaluations_dir_not_configured when empty
+        try:
+            run_id = eval_runner.start_run(
+                {
+                    "ml_repo_dir": settings.ml_repo_dir,
+                    "learnguard_bin": settings.ml_eval_learnguard_bin,
+                    "model_dir": settings.ml_eval_model_dir,
+                    "preprocessing_dir": settings.ml_eval_preprocessing_dir,
+                    "pg_dsn": settings.ml_eval_pg_dsn or settings.database_url,
+                    "judge_sample": settings.eval_judge_sample,
+                    "evaluations_dir": settings.evaluations_dir,
+                }
+            )
+        except eval_runner.EvaluationAlreadyRunning as exc:
+            raise HTTPException(
+                status_code=409, detail="evaluation_already_running"
+            ) from exc
+        except eval_runner.RunnerNotConfigured as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        _audit_evaluation(
+            action="evaluation_run",
+            entity_id=run_id,
+            payload={"trigger": "ui", "judge_sample": settings.eval_judge_sample},
+        )
+        return EvaluationRunStartedOut(run_id=run_id, status="started")
+
+    # Declared BEFORE /evaluations/{run_id} so "run-status" is never
+    # captured by the {run_id} path parameter.
+    @app.get(
+        "/evaluations/run-status",
+        response_model=EvaluationRunStatusOut,
+        tags=["evaluations"],
+        summary="Status of the latest UI-triggered evaluation run",
+    )
+    def run_evaluation_status() -> EvaluationRunStatusOut:
+        return EvaluationRunStatusOut(**eval_runner.get_state())
 
     @app.get(
         "/evaluations/{run_id}",
@@ -608,6 +762,53 @@ def create_app(
             offset=page.offset,
         )
 
+    # Declared BEFORE /predictions/{code_module}/... so the literal
+    # "stats" segment is never captured by a path parameter.
+    @app.get(
+        "/predictions/stats",
+        response_model=PredictionStatsOut,
+        tags=["advisor"],
+        summary="Aggregate prediction counts for the dashboard stat cards",
+    )
+    def prediction_stats(
+        status: Annotated[
+            str | None, Query(description="Optional status filter: "
+                                        "only narrows flagged_total")
+        ] = None,
+        code_module: Annotated[str | None, Query(max_length=8)] = None,
+        code_presentation: Annotated[str | None, Query(max_length=8)] = None,
+    ) -> PredictionStatsOut:
+        prediction_repo, audit_repo = _repositories()
+        try:
+            stats: PredictionStats = prediction_repo.stats(
+                status=status,
+                code_module=code_module,
+                code_presentation=code_presentation,
+                threshold=RISK_ALERT_THRESHOLD,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        audit_repo.append(
+            _audit_event(
+                action="prediction_stats",
+                entity_id=None,
+                payload={
+                    "status": status,
+                    "code_module": code_module,
+                    "code_presentation": code_presentation,
+                    "flagged_total": stats.flagged_total,
+                },
+            )
+        )
+        return PredictionStatsOut(
+            flagged_total=stats.flagged_total,
+            scored=stats.scored,
+            insufficient_data=stats.insufficient_data,
+            manual_review=stats.manual_review,
+            no_prediction=stats.no_prediction,
+            above_threshold=stats.above_threshold,
+        )
+
     @app.get(
         "/predictions/{code_module}/{code_presentation}/{student_key}",
         response_model=PredictionOut,
@@ -636,6 +837,51 @@ def create_app(
             )
         )
         return _to_out(record)
+
+    # Declared AFTER /predictions/{code_module}/{code_presentation}/
+    # {student_key}: this route is one segment longer, so it never clashes
+    # with the detail route's match.
+    @app.get(
+        "/predictions/{code_module}/{code_presentation}/{student_key}/activity",
+        response_model=PredictionActivityOut,
+        tags=["advisor"],
+        summary=(
+            "Raw OULAD behaviour stats for one student over the 4 weeks up "
+            "to the day-27 cutoff (Student Profile cards)"
+        ),
+    )
+    def get_prediction_activity(
+        code_module: str,
+        code_presentation: str,
+        student_key: str,
+    ) -> PredictionActivityOut:
+        data_dir = _oulad_data_dir()
+        _, audit_repo = _repositories()
+        # student_key is one-way sha256: reverse-map by hashing every
+        # id_student enrolled in this presentation (student_keys.py).
+        id_student = resolve_student_id(
+            data_dir, code_module, code_presentation, student_key
+        )
+        if id_student is None:
+            raise HTTPException(status_code=404, detail="student_not_found")
+        activity = build_student_activity(
+            data_dir, code_module, code_presentation, id_student
+        )
+        audit_repo.append(
+            _audit_event(
+                action="prediction_activity",
+                entity_id=f"{code_module}/{code_presentation}/{student_key}",
+                payload={
+                    "code_module": code_module,
+                    "code_presentation": code_presentation,
+                    "cutoff_day": STUDENT_ACTIVITY_CUTOFF_DAY,
+                    "total_clicks": sum(
+                        week["clicks"] for week in activity["weeks"]
+                    ),
+                },
+            )
+        )
+        return PredictionActivityOut(**activity)
 
     @app.get(
         "/predictions/by-student/{student_key}",
@@ -884,6 +1130,49 @@ def create_app(
             decided_at=decided_at.isoformat(),
         )
 
+    @app.get(
+        "/audit-logs",
+        response_model=AuditLogListOut,
+        tags=["admin"],
+        summary="Read audit logs for the admin system journal (read-only)",
+    )
+    def list_audit_logs(
+        limit: Annotated[
+            int, Query(description="Page size, 1-200")
+        ] = AUDIT_LOGS_DEFAULT_LIMIT,
+        action: Annotated[
+            str | None, Query(max_length=64, description="Exact action filter")
+        ] = None,
+        entity: Annotated[
+            str | None, Query(max_length=64, description="Exact entity filter")
+        ] = None,
+    ) -> AuditLogListOut:
+        if _session_factory is None:
+            raise HTTPException(
+                status_code=503,
+                detail="database_not_configured (set DATABASE_URL)",
+            )
+        # Validated in-route (not via Query(ge/le)) so an out-of-range
+        # limit answers the contract's 400 instead of FastAPI's 422.
+        if limit < 1 or limit > AUDIT_LOGS_MAX_LIMIT:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"invalid_limit (must be 1-{AUDIT_LOGS_MAX_LIMIT})"
+                ),
+            )
+        audit_repo = SQLAuditLogRepository(_session_factory)
+        page = audit_repo.list_logs(limit=limit, action=action, entity=entity)
+        # Deliberately NOT audited: reading the audit trail must not add
+        # noise to the trail itself.
+        return AuditLogListOut(
+            logs=[_to_audit_out(entry) for entry in page.items],
+            total=page.total,
+            limit=limit,
+            actions=audit_repo.distinct_actions(),
+            entities=audit_repo.distinct_entities(),
+        )
+
     return app
 
 
@@ -1010,6 +1299,20 @@ def _to_brief_out(record: BriefRecord) -> BriefOut:
         ),
         created_at=created_at.isoformat() if created_at else None,
         edited_at=raw_edited_at if isinstance(raw_edited_at, str) else None,
+    )
+
+
+def _to_audit_out(entry: AuditLogEntry) -> AuditLogOut:
+    return AuditLogOut(
+        log_id=entry.log_id,
+        at=entry.at.isoformat() if entry.at else None,
+        user_id=entry.user_id,
+        actor_email=entry.actor_email,
+        actor_name=entry.actor_name,
+        action=entry.action,
+        entity=entry.entity,
+        entity_id=entry.entity_id,
+        payload=entry.payload or {},
     )
 
 

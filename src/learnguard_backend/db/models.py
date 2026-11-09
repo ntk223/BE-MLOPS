@@ -88,3 +88,23 @@ class AuditLogRecord:
     entity: str
     entity_id: str | None = None
     payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class AuditLogEntry:
+    """One ``audit_logs`` row joined with the actor's user row.
+
+    ``actor_email``/``actor_name`` come from a LEFT JOIN on ``users``:
+    they are ``None`` when the log has no ``user_id`` (or the user was
+    later removed). Write-side counterpart is ``AuditLogRecord``.
+    """
+
+    log_id: int
+    at: datetime | None
+    user_id: int | None
+    actor_email: str | None
+    actor_name: str | None
+    action: str
+    entity: str
+    entity_id: str | None = None
+    payload: dict[str, Any] = field(default_factory=dict)

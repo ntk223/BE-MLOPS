@@ -6,11 +6,14 @@ directory are needed — the suite stays green in CI.
 
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from learnguard_backend.api import eval_runner
 from learnguard_backend.api.app import _is_valid_run_id, create_app
 from learnguard_backend.settings import BackendSettings
 
@@ -223,6 +226,152 @@ class EvaluationEndpointTests(unittest.TestCase):
         self.assertEqual(body["limit"], 2)
         self.assertEqual(body["total"], 3)
         self.assertEqual(len(body["runs"]), 2)
+
+
+class EvaluationRunTriggerTests(unittest.TestCase):
+    """POST /evaluations/run + GET /evaluations/run-status.
+
+    The module-level default subprocess runner is patched out for every
+    test in this class: no real ml-data CLI is ever spawned here.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name) / "evaluations"
+        self.root.mkdir()
+        self.ml_repo = Path(self._tmp.name) / "ml-repo"
+        self.ml_repo.mkdir()
+        eval_runner.reset_state()
+        self._original_default_runner = eval_runner._subprocess_runner
+        eval_runner._subprocess_runner = self._fake_subprocess_runner
+        self._gate: threading.Event | None = None
+        self._publish = True
+        self._returncode = 0
+        self._raise: Exception | None = None
+        self.client = TestClient(
+            create_app(
+                BackendSettings(
+                    evaluations_dir=str(self.root),
+                    ml_repo_dir=str(self.ml_repo),
+                )
+            )
+        )
+
+    def tearDown(self) -> None:
+        eval_runner._subprocess_runner = self._original_default_runner
+        eval_runner.reset_state()
+        self._tmp.cleanup()
+
+    def _fake_subprocess_runner(
+        self, config: dict, run_id: str
+    ) -> int:
+        """Same signature as eval_runner._subprocess_runner (patched in)."""
+        if self._raise is not None:
+            raise self._raise
+        if self._gate is not None:
+            self._gate.wait(timeout=10)
+        if self._publish:
+            _write_run(
+                Path(config["evaluations_dir"]), run_id, subjects={"data": 0}
+            )
+        return self._returncode
+
+    def _wait_for_status(self, *statuses: str, timeout: float = 10.0) -> dict:
+        deadline = time.monotonic() + timeout
+        body: dict = {}
+        while time.monotonic() < deadline:
+            body = self.client.get("/evaluations/run-status").json()
+            if body["status"] in statuses:
+                return body
+            time.sleep(0.05)
+        self.fail(f"status never reached {statuses}: {body}")
+
+    def test_run_status_idle_initially(self) -> None:
+        response = self.client.get("/evaluations/run-status")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "status": "idle",
+                "run_id": None,
+                "started_at": None,
+                "finished_at": None,
+                "error": None,
+                "summary": None,
+            },
+        )
+
+    def test_run_happy_path_started_then_done_with_summary(self) -> None:
+        response = self.client.post("/evaluations/run")
+        self.assertEqual(response.status_code, 202)
+        started = response.json()
+        self.assertEqual(started["status"], "started")
+        self.assertTrue(started["run_id"].startswith("eval-ui-"))
+        body = self._wait_for_status("done")
+        self.assertEqual(body["run_id"], started["run_id"])
+        self.assertIsNone(body["error"])
+        self.assertEqual(
+            body["summary"],
+            {"total": 2, "pass": 2, "warn": 0, "fail": 0, "skipped": 0},
+        )
+        self.assertIsNotNone(body["started_at"])
+        self.assertIsNotNone(body["finished_at"])
+
+    def test_second_start_while_running_is_409(self) -> None:
+        self._gate = threading.Event()
+        try:
+            first = self.client.post("/evaluations/run")
+            self.assertEqual(first.status_code, 202)
+            second = self.client.post("/evaluations/run")
+            self.assertEqual(second.status_code, 409)
+            self.assertEqual(
+                second.json()["detail"], "evaluation_already_running"
+            )
+        finally:
+            self._gate.set()
+        self._wait_for_status("done")
+
+    def test_run_status_reports_running_then_done(self) -> None:
+        self._gate = threading.Event()
+        try:
+            self.client.post("/evaluations/run")
+            body = self.client.get("/evaluations/run-status").json()
+            self.assertEqual(body["status"], "running")
+            self.assertTrue(body["run_id"].startswith("eval-ui-"))
+        finally:
+            self._gate.set()
+        self._wait_for_status("done")
+
+    def test_run_503_when_ml_repo_dir_not_configured(self) -> None:
+        client = TestClient(
+            create_app(BackendSettings(evaluations_dir=str(self.root)))
+        )
+        response = client.post("/evaluations/run")
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("ml_runner_not_configured", response.json()["detail"])
+
+    def test_run_503_when_evaluations_dir_not_configured(self) -> None:
+        client = TestClient(create_app(BackendSettings(ml_repo_dir="x")))
+        response = client.post("/evaluations/run")
+        self.assertEqual(response.status_code, 503)
+        self.assertIn(
+            "evaluations_dir_not_configured", response.json()["detail"]
+        )
+
+    def test_nonzero_exit_sets_error_state(self) -> None:
+        self._returncode = 1
+        self._publish = False
+        self.client.post("/evaluations/run")
+        body = self._wait_for_status("error")
+        self.assertIn("exited with code 1", body["error"])
+        self.assertIsNone(body["summary"])
+
+    def test_runner_exception_sets_error_state(self) -> None:
+        self._raise = RuntimeError("subprocess exploded")
+        self._publish = False
+        self.client.post("/evaluations/run")
+        body = self._wait_for_status("error")
+        self.assertIn("subprocess exploded", body["error"])
 
 
 if __name__ == "__main__":  # pragma: no cover
