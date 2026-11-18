@@ -16,6 +16,8 @@ from learnguard_backend.db.entities import (
     PREDICTION_STATUSES,
     AuditLog,
     Brief,
+    ChatMessage,
+    ChatSession,
     Decision,
     LLMCall,
     MLPrediction,
@@ -25,6 +27,8 @@ from learnguard_backend.db.models import (
     AuditLogEntry,
     AuditLogRecord,
     BriefRecord,
+    ChatMessageRecord,
+    ChatSessionRecord,
     DecisionRecord,
     LLMCallRecord,
     MLPredictionRecord,
@@ -600,3 +604,181 @@ class SQLUserRepository:
                 session.flush()
                 session.refresh(row)
                 return row.user_id
+
+
+class SQLChatRepository:
+    """Repository for managing advisor chat sessions and message turns."""
+
+    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+        self._session_factory = session_factory
+
+    @staticmethod
+    def _to_session_record(row: ChatSession) -> ChatSessionRecord:
+        return ChatSessionRecord(
+            session_id=row.session_id,
+            student_key=row.student_key,
+            code_module=row.code_module,
+            code_presentation=row.code_presentation,
+            user_id=row.user_id,
+            title=row.title,
+            status=row.status,
+            brief_id=row.brief_id,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+        )
+
+    @staticmethod
+    def _to_message_record(row: ChatMessage) -> ChatMessageRecord:
+        return ChatMessageRecord(
+            message_id=row.message_id,
+            session_id=row.session_id,
+            role=row.role,
+            content=row.content,
+            cited_evidence=list(row.cited_evidence or []),
+            tokens_used=row.tokens_used,
+            created_at=row.created_at,
+        )
+
+    def create_session(self, session_data: ChatSessionRecord) -> ChatSessionRecord:
+        with self._session_factory() as session:
+            with session.begin():
+                row = ChatSession(
+                    student_key=session_data.student_key,
+                    code_module=session_data.code_module,
+                    code_presentation=session_data.code_presentation,
+                    user_id=session_data.user_id,
+                    title=session_data.title or f"Tư vấn SV {session_data.student_key}",
+                    status=session_data.status or "active",
+                    brief_id=session_data.brief_id,
+                )
+                session.add(row)
+                session.flush()
+                session.refresh(row)
+                return self._to_session_record(row)
+
+    def get_or_create_active_session(
+        self, session_data: ChatSessionRecord
+    ) -> tuple[ChatSessionRecord, bool]:
+        """Atomically get existing active session or create a new one. Returns (record, created)."""
+        with self._session_factory() as session:
+            with session.begin():
+                existing = session.execute(
+                    select(ChatSession)
+                    .where(
+                        ChatSession.code_module == session_data.code_module,
+                        ChatSession.code_presentation == session_data.code_presentation,
+                        ChatSession.student_key == session_data.student_key,
+                        ChatSession.status == "active",
+                    )
+                    .order_by(ChatSession.updated_at.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+                if existing is not None:
+                    return self._to_session_record(existing), False
+
+                row = ChatSession(
+                    student_key=session_data.student_key,
+                    code_module=session_data.code_module,
+                    code_presentation=session_data.code_presentation,
+                    user_id=session_data.user_id,
+                    title=session_data.title or f"Tư vấn SV {session_data.student_key}",
+                    status=session_data.status or "active",
+                    brief_id=session_data.brief_id,
+                )
+                session.add(row)
+                session.flush()
+                session.refresh(row)
+                return self._to_session_record(row), True
+
+    def get_session(self, session_id: int) -> ChatSessionRecord | None:
+        with self._session_factory() as session:
+            row = session.get(ChatSession, session_id)
+            return self._to_session_record(row) if row is not None else None
+
+    def get_active_session(
+        self, code_module: str, code_presentation: str, student_key: str
+    ) -> ChatSessionRecord | None:
+        with self._session_factory() as session:
+            row = session.execute(
+                select(ChatSession)
+                .where(
+                    ChatSession.code_module == code_module,
+                    ChatSession.code_presentation == code_presentation,
+                    ChatSession.student_key == student_key,
+                    ChatSession.status == "active",
+                )
+                .order_by(ChatSession.updated_at.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            return self._to_session_record(row) if row is not None else None
+
+    def list_sessions_for_student(
+        self, code_module: str, code_presentation: str, student_key: str
+    ) -> list[ChatSessionRecord]:
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(ChatSession)
+                .where(
+                    ChatSession.code_module == code_module,
+                    ChatSession.code_presentation == code_presentation,
+                    ChatSession.student_key == student_key,
+                )
+                .order_by(ChatSession.created_at.desc())
+            ).scalars()
+            return [self._to_session_record(r) for r in rows]
+
+    def update_session(
+        self,
+        session_id: int,
+        *,
+        title: str | None = None,
+        status: str | None = None,
+        brief_id: int | None = None,
+    ) -> ChatSessionRecord | None:
+        with self._session_factory() as session:
+            with session.begin():
+                row = session.get(ChatSession, session_id)
+                if row is None:
+                    return None
+                if title is not None:
+                    row.title = title
+                if status is not None:
+                    row.status = status
+                if brief_id is not None:
+                    row.brief_id = brief_id
+                session.flush()
+                session.refresh(row)
+                return self._to_session_record(row)
+
+    def add_message(self, message: ChatMessageRecord) -> ChatMessageRecord:
+        with self._session_factory() as session:
+            with session.begin():
+                row = ChatMessage(
+                    session_id=message.session_id,
+                    role=message.role,
+                    content=message.content,
+                    cited_evidence=message.cited_evidence,
+                    tokens_used=message.tokens_used,
+                )
+                session.add(row)
+                # Touch the session's updated_at
+                parent_session = session.get(ChatSession, message.session_id)
+                if parent_session is not None:
+                    from sqlalchemy import func
+                    parent_session.updated_at = func.now()
+                session.flush()
+                session.refresh(row)
+                return self._to_message_record(row)
+
+    def list_messages(
+        self, session_id: int, limit: int = 100, offset: int = 0
+    ) -> list[ChatMessageRecord]:
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(ChatMessage)
+                .where(ChatMessage.session_id == session_id)
+                .order_by(ChatMessage.created_at.asc())
+                .limit(limit)
+                .offset(offset)
+            ).scalars()
+            return [self._to_message_record(r) for r in rows]

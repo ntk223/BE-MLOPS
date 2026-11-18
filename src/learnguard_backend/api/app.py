@@ -6,6 +6,7 @@ DB_CONTRACT.md v1.0 rev2). Every prediction access is written to
 """
 
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,12 +19,16 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
 from learnguard_backend import __version__
+
+logger = logging.getLogger("learnguard_backend.api")
 from learnguard_backend.api import eval_runner
 from learnguard_backend.api.schemas import DecisionRequest, StudentListFilters
 from learnguard_backend.db.models import (
     AuditLogEntry,
     AuditLogRecord,
     BriefRecord,
+    ChatMessageRecord,
+    ChatSessionRecord,
     DecisionRecord,
     LLMCallRecord,
     MLPredictionRecord,
@@ -34,6 +39,7 @@ from learnguard_backend.db.repository import (
     PredictionStats,
     SQLAuditLogRepository,
     SQLBriefRepository,
+    SQLChatRepository,
     SQLDecisionRepository,
     SQLLLMCallRepository,
     SQLMLPredictionRepository,
@@ -45,6 +51,11 @@ from learnguard_backend.services.briefs import (
     STATUS_UNAVAILABLE,
     AdvisorBriefService,
     build_context,
+)
+from learnguard_backend.services.chat import AdvisorChatService
+from learnguard_backend.services.chat_context import (
+    build_chat_context,
+    resolve_feature_semantics,
 )
 from learnguard_backend.services.student_activity import (
     STUDENT_ACTIVITY_CUTOFF_DAY,
@@ -200,6 +211,45 @@ class BriefDecisionOut(BaseModel):
     brief_id: int
     decision: str
     decided_at: str
+
+
+class ChatSessionCreateRequest(BaseModel):
+    code_module: str = Field(min_length=1, max_length=8)
+    code_presentation: str = Field(min_length=1, max_length=8)
+    student_key: str = Field(min_length=1, max_length=16)
+    title: str | None = None
+
+
+class ChatSessionOut(BaseModel):
+    session_id: int
+    student_key: str
+    code_module: str
+    code_presentation: str
+    user_id: int
+    title: str
+    status: str
+    brief_id: int | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    quick_prompts: list[str] = Field(default_factory=list)
+
+
+class ChatMessageSendRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=4000)
+
+
+class ChatMessageOut(BaseModel):
+    message_id: int
+    session_id: int
+    role: str
+    content: str
+    cited_evidence: list[dict[str, Any]] = Field(default_factory=list)
+    tokens_used: int = 0
+    created_at: str | None = None
+
+
+class ChatFinalizeBriefRequest(BaseModel):
+    advisor_notes: str | None = None
 
 
 class DependencyHealth(BaseModel):
@@ -459,6 +509,11 @@ def create_app(
     if settings is None:
         settings = BackendSettings.from_environment()
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
     app = FastAPI(
         title=API_TITLE,
         description=API_DESCRIPTION,
@@ -516,10 +571,37 @@ def create_app(
             SQLUserRepository(_session_factory),
         )
 
+    def _chat_repositories() -> tuple[
+        SQLChatRepository,
+        SQLMLPredictionRepository,
+        SQLBriefRepository,
+        SQLUserRepository,
+        SQLAuditLogRepository,
+        SQLLLMCallRepository,
+    ]:
+        if _session_factory is None:
+            raise HTTPException(
+                status_code=503,
+                detail="database_not_configured (set DATABASE_URL)",
+            )
+        return (
+            SQLChatRepository(_session_factory),
+            SQLMLPredictionRepository(_session_factory),
+            SQLBriefRepository(_session_factory),
+            SQLUserRepository(_session_factory),
+            SQLAuditLogRepository(_session_factory),
+            SQLLLMCallRepository(_session_factory),
+        )
+
     # M8: the brief service uses the shared LLM unless a test fake is
     # injected. Without a configured LLM, generation degrades to
     # ``unavailable`` instead of erroring.
     brief_service = AdvisorBriefService(llm=llm_service)
+    chat_service = AdvisorChatService(
+        llm=llm_service,
+        max_history_pairs=settings.chat_history_window_pairs,
+        max_input_tokens=settings.llm_max_input_tokens,
+    )
     llm_configured = (
         llm_service is not None
         or bool(settings.llm_api_key or settings.llm_fallback_model)
@@ -923,6 +1005,13 @@ def create_app(
         summary="Generate (or regenerate) an advisor brief for one prediction",
     )
     def generate_brief(body: BriefGenerateRequest) -> BriefOut:
+        logger.info(
+            "[API BRIEF] POST /briefs/generate: %s/%s/%s (llm_configured=%s)",
+            body.code_module,
+            body.code_presentation,
+            body.student_key,
+            llm_configured,
+        )
         prediction_repo, audit_repo = _repositories()
         brief_repo, _, llm_call_repo, _ = _brief_repositories()
         record = prediction_repo.get(
@@ -1130,6 +1219,310 @@ def create_app(
             decided_at=decided_at.isoformat(),
         )
 
+    # --- Interactive Advisor Chatbot Endpoints (/briefs/chat/...) ---------------
+
+    def _build_chat_context_for(record: MLPredictionRecord) -> dict[str, Any]:
+        data_dir: Path | None = None
+        if settings.oulad_data_dir:
+            p = Path(settings.oulad_data_dir)
+            if p.is_dir():
+                data_dir = p
+        return build_chat_context(
+            record,
+            data_dir=data_dir,
+            max_input_tokens=settings.llm_max_input_tokens,
+        )
+
+    @app.get(
+        "/briefs/chat/quick-prompts",
+        response_model=list[str],
+        tags=["advisor", "chat"],
+        summary="List recommended starter questions for advisor chat",
+    )
+    def list_quick_prompts() -> list[str]:
+        return AdvisorChatService.get_quick_prompts()
+
+    @app.post(
+        "/briefs/chat/sessions",
+        response_model=ChatSessionOut,
+        tags=["advisor", "chat"],
+        summary="Create or resume an active chat session for a student prediction",
+    )
+    def create_or_resume_chat_session(
+        body: ChatSessionCreateRequest,
+    ) -> ChatSessionOut:
+        logger.info(
+            "[API CHAT] POST /briefs/chat/sessions: student=%s (%s-%s)",
+            body.student_key,
+            body.code_module,
+            body.code_presentation,
+        )
+        chat_repo, pred_repo, _, user_repo, audit_repo, _ = _chat_repositories()
+        prediction = pred_repo.get(
+            body.code_module, body.code_presentation, body.student_key
+        )
+        if prediction is None:
+            raise HTTPException(status_code=404, detail="prediction_not_found")
+
+        context = _build_chat_context_for(prediction)
+        user_id = user_repo.get_or_create_system_user()
+        session_title = body.title or f"Tư vấn SV {body.student_key} ({body.code_module}-{body.code_presentation})"
+        session_record = ChatSessionRecord(
+            session_id=None,
+            student_key=body.student_key,
+            code_module=body.code_module,
+            code_presentation=body.code_presentation,
+            user_id=user_id,
+            title=session_title,
+            status="active",
+        )
+
+        if hasattr(chat_repo, "get_or_create_active_session"):
+            session_obj, created = chat_repo.get_or_create_active_session(session_record)
+        else:
+            active = chat_repo.get_active_session(
+                body.code_module, body.code_presentation, body.student_key
+            )
+            if active is not None:
+                return _to_chat_session_out(active, context)
+            session_obj = chat_repo.create_session(session_record)
+            created = True
+
+        if created:
+            audit_repo.append(
+                _audit_event(
+                    action="chat_session_create",
+                    entity_id=str(session_obj.session_id),
+                    entity="chat_session",
+                    payload={
+                        "code_module": body.code_module,
+                        "code_presentation": body.code_presentation,
+                        "student_key": body.student_key,
+                    },
+                )
+            )
+        return _to_chat_session_out(session_obj, context)
+
+    @app.get(
+        "/briefs/chat/sessions/{session_id}",
+        response_model=ChatSessionOut,
+        tags=["advisor", "chat"],
+        summary="Get details of a chat session",
+    )
+    def get_chat_session(session_id: int) -> ChatSessionOut:
+        chat_repo, pred_repo, _, _, _, _ = _chat_repositories()
+        session = chat_repo.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="chat_session_not_found")
+        prediction = pred_repo.get(
+            session.code_module, session.code_presentation, session.student_key
+        )
+        context = _build_chat_context_for(prediction) if prediction is not None else None
+        return _to_chat_session_out(session, context)
+
+    @app.get(
+        "/briefs/chat/sessions/{session_id}/messages",
+        response_model=list[ChatMessageOut],
+        tags=["advisor", "chat"],
+        summary="List messages in a chat session",
+    )
+    def list_chat_messages(
+        session_id: int,
+        limit: Annotated[int, Query(description="Limit messages", ge=1, le=200)] = 50,
+        offset: Annotated[int, Query(description="Offset", ge=0)] = 0,
+    ) -> list[ChatMessageOut]:
+        chat_repo, _, _, _, _, _ = _chat_repositories()
+        session = chat_repo.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="chat_session_not_found")
+        messages = chat_repo.list_messages(session_id, limit=limit, offset=offset)
+        return [_to_chat_message_out(m) for m in messages]
+
+    @app.post(
+        "/briefs/chat/sessions/{session_id}/messages",
+        response_model=ChatMessageOut,
+        tags=["advisor", "chat"],
+        summary="Send a message to the advisor assistant and get a reply",
+    )
+    def send_chat_message(
+        session_id: int,
+        body: ChatMessageSendRequest,
+    ) -> ChatMessageOut:
+        logger.info(
+            "[API CHAT] POST /briefs/chat/sessions/%s/messages: advisor_msg=%r",
+            session_id,
+            body.content[:80],
+        )
+        chat_repo, pred_repo, _, _, audit_repo, llm_repo = _chat_repositories()
+        session = chat_repo.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="chat_session_not_found")
+        if session.status != "active":
+            raise HTTPException(
+                status_code=400,
+                detail=f"chat_session_not_active (status is '{session.status}')",
+            )
+
+        prediction = pred_repo.get(
+            session.code_module, session.code_presentation, session.student_key
+        )
+        if prediction is None:
+            raise HTTPException(status_code=404, detail="prediction_not_found")
+
+        context = _build_chat_context_for(prediction)
+
+        # 1. Store the advisor's message
+        chat_repo.add_message(
+            ChatMessageRecord(
+                message_id=None,
+                session_id=session_id,
+                role="advisor",
+                content=body.content,
+                cited_evidence=[],
+                tokens_used=0,
+            )
+        )
+
+        # 2. Retrieve conversation history
+        history = chat_repo.list_messages(session_id, limit=20)
+
+        # 3. Call chat service for assistant reply
+        reply_content, cited_evidence, tokens_used, model_name = chat_service.reply(
+            session_id=session_id,
+            user_message=body.content,
+            history=history,
+            context=context,
+        )
+
+        # 4. Store the assistant's response
+        assistant_msg = chat_repo.add_message(
+            ChatMessageRecord(
+                message_id=None,
+                session_id=session_id,
+                role="assistant",
+                content=reply_content,
+                cited_evidence=cited_evidence,
+                tokens_used=tokens_used,
+            )
+        )
+
+        # 5. Log audit trail
+        audit_repo.append(
+            _audit_event(
+                action="chat_message_turn",
+                entity_id=str(session_id),
+                entity="chat_session",
+                payload={
+                    "advisor_msg_length": len(body.content),
+                    "reply_length": len(reply_content),
+                    "model": model_name,
+                    "tokens_used": tokens_used,
+                },
+            )
+        )
+
+        return _to_chat_message_out(assistant_msg)
+
+    @app.post(
+        "/briefs/chat/sessions/{session_id}/finalize-brief",
+        response_model=BriefOut,
+        tags=["advisor", "chat"],
+        summary="Synthesize the chat session into an official Brief record",
+    )
+    def finalize_chat_to_brief(
+        session_id: int,
+        body: ChatFinalizeBriefRequest | None = None,
+    ) -> BriefOut:
+        logger.info("[API CHAT] POST /briefs/chat/sessions/%s/finalize-brief", session_id)
+        chat_repo, pred_repo, brief_repo, user_repo, audit_repo, _ = _chat_repositories()
+        session = chat_repo.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="chat_session_not_found")
+        if session.status != "active":
+            raise HTTPException(
+                status_code=400,
+                detail=f"chat_session_not_active (status is '{session.status}')",
+            )
+
+        prediction = pred_repo.get(
+            session.code_module, session.code_presentation, session.student_key
+        )
+        if prediction is None:
+            raise HTTPException(status_code=404, detail="prediction_not_found")
+
+        context = _build_chat_context_for(prediction)
+        history = chat_repo.list_messages(session_id, limit=50)
+
+        # Synthesize into an AdvisorBriefDraft
+        draft = chat_service.finalize_to_brief(
+            session_id=session_id,
+            history=history,
+            context=context,
+        )
+
+        if body and body.advisor_notes:
+            draft.limitations.append(f"Ghi chú cố vấn: {body.advisor_notes}")
+
+        user_id = user_repo.get_or_create_system_user()
+
+        # Build mock result for _brief_content
+        from types import SimpleNamespace
+        generation_result = SimpleNamespace(
+            status="generated",
+            draft=draft,
+            model_name="advisor_chat_synthesizer",
+            latency_ms=0,
+            error_reason=None,
+        )
+
+        # Save to briefs table
+        content = _brief_content(generation_result)
+        citations = _cited_evidence(generation_result)
+        active = brief_repo.get_active(
+            session.code_module, session.code_presentation, session.student_key
+        )
+        if active is not None:
+            saved_brief = brief_repo.bump_version(
+                active.brief_id, active.version + 1, content, citations
+            )
+        else:
+            version = brief_repo.next_version(
+                session.code_module,
+                session.code_presentation,
+                session.student_key,
+            )
+            saved_brief = brief_repo.insert(
+                BriefRecord(
+                    brief_id=None,
+                    code_module=session.code_module,
+                    code_presentation=session.code_presentation,
+                    student_key=session.student_key,
+                    version=version,
+                    content=content,
+                    citations=citations,
+                    status="awaiting_review",
+                    created_by=user_id,
+                )
+            )
+
+        # Update chat session status to finalized and link brief_id
+        chat_repo.update_session(
+            session_id,
+            status="finalized",
+            brief_id=saved_brief.brief_id,
+        )
+
+        audit_repo.append(
+            _audit_event(
+                action="chat_finalize_brief",
+                entity_id=str(saved_brief.brief_id),
+                entity="brief",
+                payload={"session_id": session_id},
+            )
+        )
+
+        return _to_brief_out(saved_brief)
+
     @app.get(
         "/audit-logs",
         response_model=AuditLogListOut,
@@ -1229,15 +1622,22 @@ def _cited_evidence(result: Any) -> list[dict[str, Any]]:
         for reason in result.draft.reasons
         for name in reason.evidence_features
     }
-    return [
-        {
-            "feature_name": evidence.feature_name,
-            "observed_value": evidence.observed_value,
-            "contribution": evidence.contribution,
-        }
-        for evidence in result.draft.evidence
-        if evidence.feature_name in cited
-    ]
+    evidence_out = []
+    for evidence in result.draft.evidence:
+        if evidence.feature_name in cited:
+            sem = resolve_feature_semantics(evidence.feature_name)
+            friendly_name = sem.get("ten", evidence.feature_name)
+            evidence_out.append(
+                {
+                    "feature_name": friendly_name,
+                    "display_name": friendly_name,
+                    "raw_feature_name": evidence.feature_name,
+                    "observed_value": evidence.observed_value,
+                    "contribution": evidence.contribution,
+                    "unit": sem.get("don_vi", ""),
+                }
+            )
+    return evidence_out
 
 
 def _llm_call_status(result: Any) -> str:
@@ -1247,6 +1647,40 @@ def _llm_call_status(result: Any) -> str:
     if result.error_reason and result.error_reason.startswith("llm_error"):
         return "api_error"
     return "validation_failed"
+
+
+def _to_chat_session_out(
+    record: ChatSessionRecord, context: dict[str, Any] | None = None
+) -> ChatSessionOut:
+    created_at_str = record.created_at.isoformat() if record.created_at else None
+    updated_at_str = record.updated_at.isoformat() if record.updated_at else None
+    prompts = AdvisorChatService.get_quick_prompts(context)
+    return ChatSessionOut(
+        session_id=record.session_id or 0,
+        student_key=record.student_key,
+        code_module=record.code_module,
+        code_presentation=record.code_presentation,
+        user_id=record.user_id,
+        title=record.title,
+        status=record.status,
+        brief_id=record.brief_id,
+        created_at=created_at_str,
+        updated_at=updated_at_str,
+        quick_prompts=prompts,
+    )
+
+
+def _to_chat_message_out(record: ChatMessageRecord) -> ChatMessageOut:
+    created_at_str = record.created_at.isoformat() if record.created_at else None
+    return ChatMessageOut(
+        message_id=record.message_id or 0,
+        session_id=record.session_id,
+        role=record.role,
+        content=record.content,
+        cited_evidence=record.cited_evidence,
+        tokens_used=record.tokens_used,
+        created_at=created_at_str,
+    )
 
 
 def _to_brief_out(record: BriefRecord) -> BriefOut:

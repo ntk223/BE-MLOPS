@@ -3,12 +3,15 @@
 from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib import import_module
+import logging
 import math
 from numbers import Real
 from time import perf_counter
 from typing import Any, Mapping, Sequence
 
 from learnguard_backend.settings import BackendSettings
+
+logger = logging.getLogger("learnguard_backend.llm")
 
 
 class LLMConfigurationError(ValueError):
@@ -131,10 +134,11 @@ class LiteLLMClient:
         self.max_retries = max_retries
         self.max_input_tokens = max_input_tokens
         self.max_output_tokens = max_output_tokens
+        resolved_fallback_api_key = fallback_api_key or api_key
         self.fallback_client = (
             LiteLLMClient(
                 fallback_model,
-                api_key=fallback_api_key,
+                api_key=resolved_fallback_api_key,
                 api_base=fallback_api_base,
                 timeout_seconds=fallback_timeout_seconds,
                 max_retries=max_retries,
@@ -161,6 +165,22 @@ class LiteLLMClient:
             fallback_timeout_seconds=settings.llm_fallback_timeout_seconds,
         )
 
+    def with_max_tokens(self, max_output_tokens: int) -> "LiteLLMClient":
+        """Return a clone of this client configured with a specific max_output_tokens limit."""
+        return LiteLLMClient(
+            self.model,
+            api_key=self.api_key,
+            api_base=self.api_base,
+            timeout_seconds=self.timeout_seconds,
+            max_retries=self.max_retries,
+            max_input_tokens=self.max_input_tokens,
+            max_output_tokens=max_output_tokens,
+            fallback_model=self.fallback_client.model if self.fallback_client else None,
+            fallback_api_key=self.fallback_client.api_key if self.fallback_client else None,
+            fallback_api_base=self.fallback_client.api_base if self.fallback_client else None,
+            fallback_timeout_seconds=self.fallback_client.timeout_seconds if self.fallback_client else 120.0,
+        )
+
     @classmethod
     def from_environment(cls) -> "LiteLLMClient":
         return cls.from_settings(BackendSettings.from_environment())
@@ -171,6 +191,12 @@ class LiteLLMClient:
         **request_options: Any,
     ) -> LLMResponse:
         """Run a synchronous completion, using the configured fallback on provider failure."""
+        logger.info(
+            "[LLM START] Calling model '%s' (messages: %d, api_key: %s)",
+            self.model,
+            len(messages),
+            "present" if self.api_key else "none",
+        )
         self._validate_request(messages, request_options)
         litellm = import_module("litellm")
         self._validate_input_tokens(litellm, messages)
@@ -178,14 +204,30 @@ class LiteLLMClient:
         try:
             return self._complete_with(litellm, messages, request_options)
         except Exception as primary_error:
+            logger.warning(
+                "[LLM PRIMARY ERROR] Model '%s' failed: %s: %s",
+                self.model,
+                type(primary_error).__name__,
+                primary_error,
+            )
             if self.fallback_client is None:
                 raise
             try:
+                logger.info(
+                    "[LLM FALLBACK] Switching to fallback model '%s'...",
+                    self.fallback_client.model,
+                )
                 self.fallback_client._validate_input_tokens(litellm, messages)
                 return self.fallback_client._complete_with(
                     litellm, messages, request_options
                 )
             except Exception as fallback_error:
+                logger.error(
+                    "[LLM FALLBACK ERROR] Fallback model '%s' also failed: %s: %s",
+                    self.fallback_client.model,
+                    type(fallback_error).__name__,
+                    fallback_error,
+                )
                 raise LLMFailoverError(
                     self.model,
                     self.fallback_client.model,
@@ -199,6 +241,11 @@ class LiteLLMClient:
         **request_options: Any,
     ) -> LLMResponse:
         """Run an asynchronous completion, using the configured fallback on provider failure."""
+        logger.info(
+            "[LLM ASYNC START] Calling model '%s' (messages: %d)",
+            self.model,
+            len(messages),
+        )
         self._validate_request(messages, request_options)
         litellm = import_module("litellm")
         self._validate_input_tokens(litellm, messages)
@@ -206,14 +253,30 @@ class LiteLLMClient:
         try:
             return await self._acomplete_with(litellm, messages, request_options)
         except Exception as primary_error:
+            logger.warning(
+                "[LLM ASYNC ERROR] Model '%s' failed: %s: %s",
+                self.model,
+                type(primary_error).__name__,
+                primary_error,
+            )
             if self.fallback_client is None:
                 raise
             try:
+                logger.info(
+                    "[LLM ASYNC FALLBACK] Switching to fallback model '%s'...",
+                    self.fallback_client.model,
+                )
                 self.fallback_client._validate_input_tokens(litellm, messages)
                 return await self.fallback_client._acomplete_with(
                     litellm, messages, request_options
                 )
             except Exception as fallback_error:
+                logger.error(
+                    "[LLM ASYNC FALLBACK ERROR] Fallback model '%s' also failed: %s: %s",
+                    self.fallback_client.model,
+                    type(fallback_error).__name__,
+                    fallback_error,
+                )
                 raise LLMFailoverError(
                     self.model,
                     self.fallback_client.model,
@@ -228,12 +291,18 @@ class LiteLLMClient:
         request_options: Mapping[str, Any],
     ) -> LLMResponse:
         started_at = perf_counter()
-        response = litellm.completion(
-            **self._request_arguments(messages, request_options)
+        req_args = self._request_arguments(messages, request_options)
+        response = litellm.completion(**req_args)
+        elapsed_ms = int((perf_counter() - started_at) * 1000)
+        result = self._normalize_response(response, elapsed_ms)
+        logger.info(
+            "[LLM SUCCESS] Model '%s' replied in %d ms (tokens: %s, cost: %s)",
+            self.model,
+            elapsed_ms,
+            result.usage,
+            result.cost_usd,
         )
-        return self._normalize_response(
-            response, int((perf_counter() - started_at) * 1000)
-        )
+        return result
 
     async def _acomplete_with(
         self,
@@ -242,12 +311,17 @@ class LiteLLMClient:
         request_options: Mapping[str, Any],
     ) -> LLMResponse:
         started_at = perf_counter()
-        response = await litellm.acompletion(
-            **self._request_arguments(messages, request_options)
+        req_args = self._request_arguments(messages, request_options)
+        response = await litellm.acompletion(**req_args)
+        elapsed_ms = int((perf_counter() - started_at) * 1000)
+        result = self._normalize_response(response, elapsed_ms)
+        logger.info(
+            "[LLM ASYNC SUCCESS] Model '%s' replied in %d ms (tokens: %s)",
+            self.model,
+            elapsed_ms,
+            result.usage,
         )
-        return self._normalize_response(
-            response, int((perf_counter() - started_at) * 1000)
-        )
+        return result
 
     def _request_arguments(
         self,
@@ -363,6 +437,10 @@ class LLMService:
     ) -> LLMResponse:
         """Generate a completion using the configured primary/fallback models."""
         return self._client.complete(messages, **request_options)
+
+    def with_max_tokens(self, max_tokens: int) -> "LLMService":
+        """Return a copy of LLMService with a specific max_output_tokens limit."""
+        return LLMService(self._client.with_max_tokens(max_tokens))
 
     async def acomplete(
         self,

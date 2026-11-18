@@ -42,6 +42,8 @@ BRIEF_STATUSES = ("awaiting_review", "accepted", "rejected")
 USER_ROLES = ("advisor", "admin")
 DECISION_ACTIONS = ("accept", "reject", "edit")
 LLM_CALL_STATUSES = ("ok", "validation_failed", "api_error")
+CHAT_SESSION_STATUSES = ("active", "finalized", "archived")
+CHAT_ROLES = ("advisor", "assistant")
 
 PREDICTION_BATCH_SCHEMA_VERSION = "prediction-batch.v1"
 
@@ -129,7 +131,9 @@ class Brief(Base):
     )
 
     brief_id: Mapped[int] = mapped_column(
-        BIGINT, primary_key=True, autoincrement=True
+        BIGINT().with_variant(INTEGER, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
     )
     student_key: Mapped[str] = mapped_column(CHAR(16), nullable=False)
     code_module: Mapped[str] = mapped_column(String(8), nullable=False)
@@ -233,7 +237,94 @@ class AuditLog(Base):
     )
 
 
-BACKEND_OWNED_ENTITIES = (User, Brief, Decision, LLMCall, AuditLog)
+# --- §6.8 chat_sessions & chat_messages ------------------------------------------------
+
+
+class ChatSession(Base):
+    """Interactive advisor Q&A session scoped to a student prediction."""
+
+    __tablename__ = "chat_sessions"
+    __table_args__ = (
+        Index(
+            "idx_chat_sessions_student",
+            "code_module",
+            "code_presentation",
+            "student_key",
+        ),
+        Index("idx_chat_sessions_user", "user_id", "status"),
+    )
+
+    session_id: Mapped[int] = mapped_column(
+        BIGINT().with_variant(INTEGER, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    student_key: Mapped[str] = mapped_column(CHAR(16), nullable=False)
+    code_module: Mapped[str] = mapped_column(String(8), nullable=False)
+    code_presentation: Mapped[str] = mapped_column(String(8), nullable=False)
+    user_id: Mapped[int] = mapped_column(
+        BIGINT, ForeignKey("users.user_id"), nullable=False
+    )
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(24),
+        CheckConstraint("status IN ('active', 'finalized', 'archived')"),
+        nullable=False,
+        server_default=text("'active'"),
+    )
+    brief_id: Mapped[int | None] = mapped_column(
+        BIGINT, ForeignKey("briefs.brief_id")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+
+
+class ChatMessage(Base):
+    """Single message turn in an advisor chat session."""
+
+    __tablename__ = "chat_messages"
+    __table_args__ = (
+        Index("idx_chat_messages_session", "session_id", "created_at"),
+    )
+
+    message_id: Mapped[int] = mapped_column(
+        BIGINT().with_variant(INTEGER, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    session_id: Mapped[int] = mapped_column(
+        BIGINT, ForeignKey("chat_sessions.session_id", ondelete="CASCADE"), nullable=False
+    )
+    role: Mapped[str] = mapped_column(
+        String(16),
+        CheckConstraint("role IN ('advisor', 'assistant')"),
+        nullable=False,
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    cited_evidence: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    tokens_used: Mapped[int] = mapped_column(
+        INTEGER, nullable=False, server_default=text("0")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+
+
+BACKEND_OWNED_ENTITIES = (
+    User,
+    Brief,
+    Decision,
+    LLMCall,
+    AuditLog,
+    ChatSession,
+    ChatMessage,
+)
 
 __all__ = [
     "AuditLog",
@@ -241,6 +332,10 @@ __all__ = [
     "Base",
     "Brief",
     "BRIEF_STATUSES",
+    "ChatMessage",
+    "ChatSession",
+    "CHAT_ROLES",
+    "CHAT_SESSION_STATUSES",
     "DECISION_ACTIONS",
     "Decision",
     "LLMCall",

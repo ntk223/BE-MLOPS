@@ -26,6 +26,7 @@ class BackendSettings:
     llm_max_retries: int = 2
     llm_max_input_tokens: int = 8000
     llm_max_output_tokens: int = 1000
+    chat_history_window_pairs: int = 3
     ml_data_api_url: str = ""
     cors_origins: str = ""
     batch_dir: str = ""
@@ -60,12 +61,15 @@ class BackendSettings:
             max_retries = int(os.getenv("LLM_MAX_RETRIES", "2"))
             max_input_tokens = int(os.getenv("LLM_MAX_INPUT_TOKENS", "8000"))
             max_output_tokens = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "1000"))
+            chat_history_window_pairs = int(
+                os.getenv("CHAT_HISTORY_WINDOW_PAIRS", "3")
+            )
         except ValueError as exc:
             raise ValueError(
                 "LLM_TIMEOUT_SECONDS and LLM_FALLBACK_TIMEOUT_SECONDS must be "
                 "numeric, and "
-                "LLM_MAX_RETRIES, LLM_MAX_INPUT_TOKENS, and "
-                "LLM_MAX_OUTPUT_TOKENS must be integers."
+                "LLM_MAX_RETRIES, LLM_MAX_INPUT_TOKENS, LLM_MAX_OUTPUT_TOKENS, "
+                "and CHAT_HISTORY_WINDOW_PAIRS must be integers."
             ) from exc
 
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
@@ -83,6 +87,10 @@ class BackendSettings:
             raise ValueError("LLM_MAX_INPUT_TOKENS must be greater than zero.")
         if max_output_tokens <= 0:
             raise ValueError("LLM_MAX_OUTPUT_TOKENS must be greater than zero.")
+        if chat_history_window_pairs <= 0:
+            raise ValueError(
+                "CHAT_HISTORY_WINDOW_PAIRS must be greater than zero."
+            )
 
         try:
             judge_sample = int(os.getenv("EVAL_JUDGE_SAMPLE", "4"))
@@ -105,6 +113,7 @@ class BackendSettings:
             llm_max_retries=max_retries,
             llm_max_input_tokens=max_input_tokens,
             llm_max_output_tokens=max_output_tokens,
+            chat_history_window_pairs=chat_history_window_pairs,
             ml_data_api_url=os.getenv("ML_DATA_API_URL", ""),
             cors_origins=os.getenv(
                 "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
