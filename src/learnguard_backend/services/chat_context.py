@@ -166,22 +166,62 @@ def apply_semantic_layer(prediction_ctx: dict[str, Any]) -> dict[str, Any]:
     risk_score = result.get("risk_score")
     threshold = result.get("threshold", 0.5)
     uncertainty = result.get("uncertainty")
-    status = result.get("status")
+    status = result.get("status", "scored")
+    review_reason = result.get("review_reason")
 
     thresh_val = threshold if threshold is not None else 0.5
     is_high_risk = (risk_score is not None) and (risk_score >= thresh_val)
 
+    if status == "manual_review":
+        danh_gia_risk = (
+            "CẦN XEM XÉT THỦ CÔNG (Độ bất định cao - Hệ thống chỉ đưa ra quan điểm tham khảo, KHÔNG tự động đánh giá/kết luận)"
+        )
+        giai_thich_risk = (
+            f"Mô hình ghi nhận risk_score là {risk_score} (ngưỡng {thresh_val}), nhưng độ bất định cao (uncertainty = {uncertainty}). "
+            "Theo quy định, hệ thống KHÔNG được tự động đánh giá hay kết luận dán nhãn sinh viên, "
+            "mà CHỈ ĐƯỢC ĐƯA RA QUAN ĐIỂM / GÓC NHÌN THAM KHẢO để Cố vấn học tập tự xem xét và đánh giá thủ công."
+        )
+        giai_thich_status = (
+            "manual_review: Độ bất định của mô hình cao (uncertainty >= 0.8) hoặc tín hiệu mâu thuẫn. "
+            "Hệ thống KHÔNG tự động kết luận rủi ro thay cho người dùng, mà chỉ cung cấp góc nhìn gợi ý để Cố vấn tự đánh giá thủ công."
+        )
+    elif status == "insufficient_data":
+        danh_gia_risk = (
+            "THIẾU DỮ LIỆU ĐỂ ĐÁNH GIÁ (Dự đoán ngoại suy, không sử dụng làm kết luận rủi ro)"
+        )
+        giai_thich_risk = (
+            f"Sinh viên bị thiếu dữ liệu hành vi thực tế (chưa có tương tác VLE hoặc chưa có bài kiểm tra nộp). "
+            f"Điểm risk_score ({risk_score}) chỉ là giá trị ngoại suy kỹ thuật trên dữ liệu điền khuyết (imputed data). "
+            "TUYỆT ĐỐI KHÔNG dùng điểm số này để tự động kết luận sinh viên có rủi ro hay an toàn."
+        )
+        giai_thich_status = (
+            "insufficient_data: Sinh viên bị đánh tag thiếu dữ liệu học tập đầu vào "
+            "(ví dụ: đăng ký muộn, không có tương tác VLE, hoặc chưa có bài kiểm tra). "
+            "Mô hình không thể dự đoán chính xác; Cố vấn cần kiểm tra dữ liệu thực tế hoặc liên hệ trực tiếp sinh viên."
+        )
+    elif status == "no_prediction":
+        danh_gia_risk = "CHƯA CÓ DỰ ĐOÁN TỪ MÔ HÌNH"
+        giai_thich_risk = "Chưa có kết quả dự báo điểm rủi ro từ mô hình Machine Learning cho sinh viên này."
+        giai_thich_status = (
+            "no_prediction: Mô hình Machine Learning chưa/không thể chạy dự đoán cho hồ sơ này. "
+            "Cố vấn cần theo dõi tiến độ học tập qua các kênh quản lý học vụ thông thường."
+        )
+    else:  # "scored" or other
+        danh_gia_risk = "NGUY CƠ RỚT MÔN CAO (Cần can thiệp)" if is_high_risk else "NGUY CƠ THẤP / AN TOÀN"
+        giai_thich_risk = (
+            f"Xác suất sinh viên có nguy cơ rớt môn được dự báo bởi mô hình AI (dựa trên 4 tuần đầu kỳ). "
+            f"Giá trị hiện tại là {risk_score} (ngưỡng phân loại là {thresh_val}). "
+            f"{'Vượt ngưỡng -> Sinh viên cần được cố vấn hỗ trợ sớm.' if is_high_risk else 'Dưới ngưỡng -> Sinh viên đang tiến độ tốt.'}"
+        )
+        giai_thich_status = "scored: mô hình đã chấm điểm dự báo tự động thành công với độ tin cậy tốt."
+
     # 1. Thang điểm và ý nghĩa các chỉ số mô hình
-    result["y_nghia_thang_diem_va_chi_so"] = {
+    thang_diem_chi_so: dict[str, Any] = {
         "diem_nguy_co (risk_score)": {
             "gia_tri": risk_score,
             "thang_do": "0.00 đến 1.00 (tương đương 0% đến 100%)",
-            "danh_gia": "NGUY CƠ RỚT MÔN CAO (Cần can thiệp)" if is_high_risk else "NGUY CƠ THẤP / AN TOÀN",
-            "giai_thich": (
-                f"Xác suất sinh viên có nguy cơ rớt môn được dự báo bởi mô hình AI (dựa trên 4 tuần đầu kỳ). "
-                f"Giá trị hiện tại là {risk_score} (ngưỡng phân loại là {thresh_val}). "
-                f"{'Vượt ngưỡng -> Sinh viên cần được cố vấn hỗ trợ sớm.' if is_high_risk else 'Dưới ngưỡng -> Sinh viên đang tiến độ tốt.'}"
-            ),
+            "danh_gia": danh_gia_risk,
+            "giai_thich": giai_thich_risk,
         },
         "nguong_quyet_dinh (threshold)": {
             "gia_tri": thresh_val,
@@ -192,18 +232,35 @@ def apply_semantic_layer(prediction_ctx: dict[str, Any]) -> dict[str, Any]:
             "thang_do": "0.00 đến 1.00",
             "giai_thich": (
                 "Độ không chắc chắn của mô hình. Giá trị càng thấp độ tin cậy càng cao. "
-                "Nếu > 0.30, cố vấn nên trao đổi trực tiếp với sinh viên để nắm thêm hoàn cảnh thực tế."
+                "Nếu >= 0.80 hoặc hồ sơ ở trạng thái manual_review, hệ thống chỉ nêu quan điểm tham khảo để cố vấn tự xem xét thủ công."
             ),
         },
         "trang_thai_ho_so (status)": {
             "gia_tri": status,
-            "giai_thich": "scored: mô hình đã chấm điểm dự báo tự động thành công.",
+            "giai_thich": giai_thich_status,
         },
         "quy_tac_y_nghia_SHAP": {
             "contribution_duong (>0)": "Đặc trưng LÀM TĂNG NGUY CƠ RỚT MÔN (nguyên nhân gây rủi ro chính cần can thiệp).",
             "contribution_am (<0)": "Đặc trưng GIÚP GIẢM NGUY CƠ RỚT MÔN (điểm mạnh/điểm sáng tích cực của sinh viên).",
         },
     }
+
+    if review_reason:
+        reason_explanation = (
+            "Thiếu dữ liệu hành vi học tập đầu vào."
+            if review_reason == "insufficient_data"
+            else "Độ bất định mô hình cao (uncertainty >= 0.8)."
+            if review_reason == "high_uncertainty"
+            else "Chưa có dự đoán từ mô hình."
+            if review_reason == "no_prediction"
+            else f"Lý do rà soát: {review_reason}."
+        )
+        thang_diem_chi_so["ly_do_ra_soat (review_reason)"] = {
+            "gia_tri": review_reason,
+            "giai_thich": reason_explanation,
+        }
+
+    result["y_nghia_thang_diem_va_chi_so"] = thang_diem_chi_so
 
     # 2. Dịch nghĩa các tín hiệu SHAP (top_signals)
     raw_signals = result.get("top_signals", [])
@@ -247,10 +304,57 @@ def apply_semantic_layer(prediction_ctx: dict[str, Any]) -> dict[str, Any]:
 
     return result
 
-# --- Advisor guidelines (loaded once, cached) ----------------------------
+# --- Advisor guidelines (loaded once, parsed into sections, cached) -------
 
 _GUIDELINES_PATH = Path(__file__).with_name("advisor_guidelines.md")
 _guidelines_cache: str | None = None
+_guidelines_sections_cache: dict[str, str] | None = None
+
+# Section keys that map to heading patterns in advisor_guidelines.md.
+# Each key identifies a logical section of the handbook.
+_SECTION_HEADINGS: list[tuple[str, str]] = [
+    ("risk_classification", "## 1. Phân Loại Mức Độ Rủi Ro"),
+    ("metrics_explanation", "## 2. Giải Thích Các Chỉ Số Chính"),
+    ("communication",       "## 3. Hướng Dẫn Giao Tiếp"),
+    ("escalation",          "## 4. Quy Trình Escalation"),
+    ("important_notes",     "## 5. Lưu Ý Quan Trọng"),
+    ("crisis",              "## 6. Xử Lý Tình Huống Khẩn Cấp"),
+]
+
+# Which guideline sections to inject for each chat intent.
+# Empty list = no guidelines needed → saves all guideline tokens.
+INTENT_TO_SECTIONS: dict[str, list[str]] = {
+    "why_risk":          [],  # Data-only answer, no guidelines needed
+    "casual":            [],  # Greeting/small-talk, no guidelines needed
+    "intervention":      ["risk_classification", "escalation", "crisis"],
+    "draft_email":       ["communication"],
+    "general_analysis":  ["metrics_explanation", "important_notes"],
+}
+
+
+def _parse_sections(full_text: str) -> dict[str, str]:
+    """Split the full guidelines markdown into named sections by ## headings.
+
+    Each section spans from its heading to the next heading (or EOF).
+    """
+    sections: dict[str, str] = {}
+    # Build (key, start_index) pairs for sections found in text
+    positions: list[tuple[str, int]] = []
+    for key, heading in _SECTION_HEADINGS:
+        idx = full_text.find(heading)
+        if idx != -1:
+            positions.append((key, idx))
+
+    # Sort by position in document
+    positions.sort(key=lambda x: x[1])
+
+    for i, (key, start) in enumerate(positions):
+        end = positions[i + 1][1] if i + 1 < len(positions) else len(full_text)
+        section_text = full_text[start:end].strip()
+        if section_text:
+            sections[key] = section_text
+
+    return sections
 
 
 def _load_guidelines(path: Path | None = None) -> str:
@@ -274,10 +378,48 @@ def _load_guidelines(path: Path | None = None) -> str:
         return ""
 
 
+def _load_guideline_sections(path: Path | None = None) -> dict[str, str]:
+    """Load and parse guidelines into named sections (cached)."""
+    global _guidelines_sections_cache
+    if _guidelines_sections_cache is not None:
+        return _guidelines_sections_cache
+
+    full_text = _load_guidelines(path)
+    if not full_text:
+        _guidelines_sections_cache = {}
+        return _guidelines_sections_cache
+
+    _guidelines_sections_cache = _parse_sections(full_text)
+    logger.info(
+        "Parsed advisor guidelines into %d sections: %s",
+        len(_guidelines_sections_cache),
+        list(_guidelines_sections_cache.keys()),
+    )
+    return _guidelines_sections_cache
+
+
+def select_guidelines_for_intent(intent: str, path: Path | None = None) -> str:
+    """Return only the guideline sections relevant to the given intent.
+
+    This is the core of the Intent-based Section Loading optimisation:
+    instead of injecting the full ~12 KB handbook into every LLM context,
+    we select only the 1-3 sections that match the advisor's intent,
+    cutting guideline tokens by 70-80%.
+    """
+    section_keys = INTENT_TO_SECTIONS.get(intent, [])
+    if not section_keys:
+        return ""
+
+    sections = _load_guideline_sections(path)
+    parts = [sections[k] for k in section_keys if k in sections]
+    return "\n\n---\n\n".join(parts) if parts else ""
+
+
 def reset_guidelines_cache() -> None:
     """Reset the cached guidelines (for tests or hot-reload)."""
-    global _guidelines_cache
+    global _guidelines_cache, _guidelines_sections_cache
     _guidelines_cache = None
+    _guidelines_sections_cache = None
 
 
 # --- Token budget helpers ------------------------------------------------
@@ -410,6 +552,7 @@ def build_chat_context(
     data_dir: Path | None = None,
     guidelines_path: Path | None = None,
     max_input_tokens: int = 8000,
+    intent: str | None = None,
 ) -> dict[str, Any]:
     """Build a comprehensive, PII-free context dict for the chat LLM.
 
@@ -423,6 +566,11 @@ def build_chat_context(
         Override path for ``advisor_guidelines.md``.  ``None`` → default.
     max_input_tokens
         Total token budget for the entire LLM input.
+    intent
+        Chat intent (from ``classify_message_intent``).  When provided,
+        only the guideline sections relevant to this intent are loaded
+        instead of the full handbook, cutting guideline tokens by 70-80%.
+        ``None`` falls back to loading the full file (legacy behaviour).
 
     Returns
     -------
@@ -469,8 +617,13 @@ def build_chat_context(
                 prediction_record.student_key,
             )
 
-    # 3. Advisor guidelines
-    raw_guidelines = _load_guidelines(guidelines_path)
+    # 3. Advisor guidelines — intent-based section loading
+    if intent is not None:
+        # New path: load only the sections relevant to this intent.
+        raw_guidelines = select_guidelines_for_intent(intent, guidelines_path)
+    else:
+        # Legacy path: load the full file (for callers that don't pass intent).
+        raw_guidelines = _load_guidelines(guidelines_path)
     guidelines_available = bool(raw_guidelines)
 
     # 4. Token budget management
@@ -512,8 +665,14 @@ def prune_context_for_intent(context: dict[str, Any], intent: str = "general_ana
 
     - 'why_risk': Omit guidelines, and prune top_signals to only keep risk factors (contribution > 0).
     - 'casual': Omit guidelines and detailed activity.
-    - 'intervention': Keep guidelines and focus on action steps.
-    - 'draft_email': Keep guidelines (email templates) and student highlights.
+    - 'intervention': Keep only intervention-related guideline sections.
+    - 'draft_email': Keep only email template guideline sections.
+    - 'general_analysis': Keep only metrics explanation guideline sections.
+
+    When guidelines were loaded as the full file (legacy callers that don't
+    pass ``intent`` to ``build_chat_context``), this function replaces them
+    with only the sections relevant to the current intent — achieving the
+    same token savings retroactively.
     """
     pruned = dict(context)
 
@@ -541,9 +700,21 @@ def prune_context_for_intent(context: dict[str, Any], intent: str = "general_ana
         else:
             pruned = pred
 
-    # 2. Guidelines pruning: Hide handbook when asking "why" or greeting
-    if intent in ("why_risk", "casual"):
+    # 2. Guidelines pruning: replace full guidelines with intent-relevant sections
+    section_keys = INTENT_TO_SECTIONS.get(intent, [])
+    if not section_keys:
+        # Intent needs no guidelines at all (why_risk, casual)
         pruned["guidelines"] = None
+    elif pruned.get("guidelines"):
+        guidelines_text = str(pruned["guidelines"])
+        has_handbook_markers = any(heading in guidelines_text for _, heading in _SECTION_HEADINGS)
+        if has_handbook_markers:
+            # Parse sections directly from the provided text
+            sections = _parse_sections(guidelines_text)
+            if sections:
+                parts = [sections[k] for k in section_keys if k in sections]
+                if parts:
+                    pruned["guidelines"] = "\n\n---\n\n".join(parts)
 
     # 3. Activity pruning: Hide detailed logs in casual greetings
     if intent == "casual":

@@ -101,7 +101,8 @@ class AdvisorChatServiceTests(unittest.TestCase):
 
         self.assertIn("clicks__n_clicks_before_cutoff", reply)
         self.assertEqual(len(citations), 1)
-        self.assertEqual(citations[0]["feature_name"], "clicks__n_clicks_before_cutoff")
+        self.assertEqual(citations[0]["feature_name"], "Tổng lượt tương tác học tập (VLE)")
+        self.assertEqual(citations[0]["raw_feature_name"], "clicks__n_clicks_before_cutoff")
         self.assertEqual(tokens, 80)
         self.assertEqual(model, "test/fake-model")
 
@@ -634,7 +635,8 @@ class SemanticLayerAndDualModeTests(unittest.TestCase):
         self.assertIn("💡 *Gợi ý bước tiếp theo:*", reply)
         self.assertIn("xem quy trình can thiệp", reply)
         self.assertEqual(len(citations), 2, "Trích xuất chính xác 100% cả 2 đặc trưng từ cited_features")
-        self.assertEqual(citations[0]["feature_name"], "clicks__n_clicks_before_cutoff")
+        self.assertEqual(citations[0]["feature_name"], "Tổng lượt tương tác học tập (VLE)")
+        self.assertEqual(citations[0]["raw_feature_name"], "clicks__n_clicks_before_cutoff")
         self.assertEqual(citations[0]["observed_value"], 12)
         self.assertEqual(citations[0]["contribution"], 0.42)
 
@@ -660,6 +662,74 @@ class SemanticLayerAndDualModeTests(unittest.TestCase):
         self.assertEqual(len(signals), 1, "Chỉ giữ các tín hiệu làm tăng rủi ro")
         self.assertEqual(signals[0]["feature_name"], "bad_clicks")
 
+    def test_cited_evidence_semantic_mapping(self):
+        from learnguard_backend.services.chat import AdvisorChatService
+
+        structured_response = json.dumps(
+            {
+                "direct_answer": "Sinh viên có 3 tín hiệu cảnh báo chính về học tập.",
+                "cited_features": [
+                    "score__missingindicator_avg_score_submitted",
+                    "clicks__n_clicks_before_cutoff",
+                    "numeric__n_submitted_before_cutoff",
+                ],
+                "next_step_suggestion": "Cố vấn nên liên hệ hỗ trợ sớm.",
+            },
+            ensure_ascii=False,
+        )
+        fake_llm = FakeLLM(content=structured_response)
+        service = AdvisorChatService(llm=fake_llm)
+        context = {
+            "student_key": "test_student",
+            "risk_score": 0.88,
+            "top_signals": [
+                {
+                    "feature_name": "score__missingindicator_avg_score_submitted",
+                    "observed_value": 1,
+                    "contribution": 0.87,
+                    "direction": "increases_risk",
+                },
+                {
+                    "feature_name": "clicks__n_clicks_before_cutoff",
+                    "observed_value": 23,
+                    "contribution": 0.35,
+                    "direction": "increases_risk",
+                },
+                {
+                    "feature_name": "numeric__n_submitted_before_cutoff",
+                    "observed_value": 0,
+                    "contribution": 0.25,
+                    "direction": "increases_risk",
+                },
+            ],
+            "features": {
+                "score__missingindicator_avg_score_submitted": 1,
+                "clicks__n_clicks_before_cutoff": 23,
+                "numeric__n_submitted_before_cutoff": 0,
+            },
+        }
+
+        _, citations, _, _ = service.reply(
+            session_id=1,
+            user_message="Tại sao sinh viên này có nguy cơ rớt môn cao?",
+            history=[],
+            context=context,
+        )
+
+        self.assertEqual(len(citations), 3)
+        # Check mapping to Vietnamese friendly names
+        self.assertEqual(citations[0]["feature_name"], "Chưa có điểm bài tập nào trước cutoff")
+        self.assertEqual(citations[0]["raw_feature_name"], "score__missingindicator_avg_score_submitted")
+        self.assertEqual(citations[0]["contribution"], 0.87)
+
+        self.assertEqual(citations[1]["feature_name"], "Tổng lượt tương tác học tập (VLE)")
+        self.assertEqual(citations[1]["raw_feature_name"], "clicks__n_clicks_before_cutoff")
+        self.assertEqual(citations[1]["observed_value"], 23)
+
+        self.assertEqual(citations[2]["feature_name"], "Số bài đánh giá đã nộp")
+        self.assertEqual(citations[2]["raw_feature_name"], "numeric__n_submitted_before_cutoff")
+        self.assertEqual(citations[2]["observed_value"], 0)
+
     def test_system_prompt_guardrails_and_completeness_rules(self):
         from learnguard_backend.services.chat import CHAT_SYSTEM_PROMPT, INTENT_DIRECTIVES, STRUCTURED_OUTPUT_PROMPT
 
@@ -674,6 +744,86 @@ class SemanticLayerAndDualModeTests(unittest.TestCase):
         self.assertIn("Dưới đây là...", STRUCTURED_OUTPUT_PROMPT)
         self.assertIn("Dưới đây là...", INTENT_DIRECTIVES["intervention"])
         self.assertIn("Dưới đây là...", INTENT_DIRECTIVES["draft_email"])
+
+        # Status guardrail checks
+        self.assertIn("QUY TẮC BẮT BUỘC THEO TRẠNG THÁI DỰ ĐOÁN", CHAT_SYSTEM_PROMPT)
+        self.assertIn("manual_review", CHAT_SYSTEM_PROMPT)
+        self.assertIn("KHÔNG tự động đánh giá", CHAT_SYSTEM_PROMPT)
+        self.assertIn("CHỈ ĐƯỢC PHÉP ĐƯA RA QUAN ĐIỂM", CHAT_SYSTEM_PROMPT)
+        self.assertIn("insufficient_data", CHAT_SYSTEM_PROMPT)
+
+        # Chain of Thought checks
+        self.assertIn("QUY TRÌNH TƯ DUY BẮT BUỘC (CHAIN OF THOUGHT)", CHAT_SYSTEM_PROMPT)
+        self.assertIn("ĐỌC TRẠNG THÁI & ĐỘ BẤT ĐỊNH", CHAT_SYSTEM_PROMPT)
+        self.assertIn("ĐÁNH GIÁ Ý NGHĨA THỰC SỰ CỦA CON SỐ", CHAT_SYSTEM_PROMPT)
+        self.assertIn("ĐƯA RA KẾT LUẬN ĐỘC LẬP", CHAT_SYSTEM_PROMPT)
+        self.assertIn("tuyệt đối không được đánh đồng đây là sinh viên học yếu", CHAT_SYSTEM_PROMPT)
+
+    def test_semantic_layer_handles_manual_review_status(self):
+        from learnguard_backend.services.chat_context import apply_semantic_layer
+
+        raw_context = {
+            "student_key": "test_mr",
+            "risk_score": 0.88,
+            "threshold": 0.5,
+            "uncertainty": 0.85,
+            "status": "manual_review",
+            "review_reason": "high_uncertainty",
+        }
+        enriched = apply_semantic_layer(raw_context)
+        scales = enriched["y_nghia_thang_diem_va_chi_so"]
+        
+        # Must not assert high risk conclusively; must indicate manual review
+        danh_gia = scales["diem_nguy_co (risk_score)"]["danh_gia"]
+        self.assertIn("CẦN XEM XÉT THỦ CÔNG", danh_gia)
+        self.assertIn("KHÔNG tự động đánh giá", danh_gia)
+        self.assertIn("quan điểm tham khảo", danh_gia)
+
+        status_info = scales["trang_thai_ho_so (status)"]
+        self.assertEqual(status_info["gia_tri"], "manual_review")
+        self.assertIn("KHÔNG tự động kết luận", status_info["giai_thich"])
+
+        # Review reason check
+        self.assertIn("ly_do_ra_soat (review_reason)", scales)
+        self.assertEqual(scales["ly_do_ra_soat (review_reason)"]["gia_tri"], "high_uncertainty")
+
+    def test_semantic_layer_handles_insufficient_data_status(self):
+        from learnguard_backend.services.chat_context import apply_semantic_layer
+
+        raw_context = {
+            "student_key": "test_id",
+            "risk_score": 0.92,
+            "threshold": 0.5,
+            "uncertainty": None,
+            "status": "insufficient_data",
+            "review_reason": "insufficient_data",
+        }
+        enriched = apply_semantic_layer(raw_context)
+        scales = enriched["y_nghia_thang_diem_va_chi_so"]
+        
+        # Must warn about insufficient data & extrapolation
+        danh_gia = scales["diem_nguy_co (risk_score)"]["danh_gia"]
+        self.assertIn("THIẾU DỮ LIỆU ĐỂ ĐÁNH GIÁ", danh_gia)
+        self.assertIn("ngoại suy", danh_gia)
+
+        status_info = scales["trang_thai_ho_so (status)"]
+        self.assertEqual(status_info["gia_tri"], "insufficient_data")
+        self.assertIn("thiếu dữ liệu học tập", status_info["giai_thich"])
+
+    def test_semantic_layer_handles_no_prediction_status(self):
+        from learnguard_backend.services.chat_context import apply_semantic_layer
+
+        raw_context = {
+            "student_key": "test_np",
+            "risk_score": None,
+            "status": "no_prediction",
+        }
+        enriched = apply_semantic_layer(raw_context)
+        scales = enriched["y_nghia_thang_diem_va_chi_so"]
+        
+        danh_gia = scales["diem_nguy_co (risk_score)"]["danh_gia"]
+        self.assertIn("CHƯA CÓ DỰ ĐOÁN", danh_gia)
+        self.assertEqual(scales["trang_thai_ho_so (status)"]["gia_tri"], "no_prediction")
 
 
 class ChatSlidingWindowTests(unittest.TestCase):

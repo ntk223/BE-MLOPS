@@ -33,7 +33,10 @@ BRIEF_SYSTEM_PROMPT = (
     "(ghi trong evidence_features); không được dùng feature nào khác.\n"
     "3. Không nhắc đến bất kỳ định danh cá nhân nào; chỉ được dùng student_key "
     "đã băm nếu cần.\n"
-    "4. Trả về DUY NHẤT một đối tượng JSON hợp lệ, không kèm markdown hay giải "
+    "4. Phải kiểm tra trạng thái 'status': nếu là 'manual_review', chỉ đưa ra quan điểm "
+    "phân tích tham khảo, KHÔNG tự động kết luận khẳng định (nêu rõ cần cố vấn xem xét thủ công trong limitations); "
+    "nếu là 'insufficient_data', phải nêu rõ hồ sơ thiếu dữ liệu và đưa vào limitations.\n"
+    "5. Trả về DUY NHẤT một đối tượng JSON hợp lệ, không kèm markdown hay giải "
     "thích, theo đúng schema:\n"
     '{"summary": str, "reasons": [{"text": str, "evidence_features": [str]}], '
     '"support_suggestions": [str], "limitations": [str]}'
@@ -154,6 +157,7 @@ def build_context(record: Any) -> dict[str, Any]:
         "risk_score": record.risk_score,
         "threshold": record.threshold,
         "uncertainty": record.uncertainty,
+        "review_reason": getattr(record, "review_reason", None),
         "cutoff_day": record.cutoff_day,
         "top_signals": top_signals,
         "features": features,

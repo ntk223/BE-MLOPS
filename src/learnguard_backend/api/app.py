@@ -53,7 +53,10 @@ from learnguard_backend.services.briefs import (
     build_context,
 )
 from learnguard_backend.services.chat import AdvisorChatService
-from learnguard_backend.services.chat_context import build_chat_context
+from learnguard_backend.services.chat_context import (
+    build_chat_context,
+    resolve_feature_semantics,
+)
 from learnguard_backend.services.student_activity import (
     STUDENT_ACTIVITY_CUTOFF_DAY,
     build_student_activity,
@@ -1619,15 +1622,22 @@ def _cited_evidence(result: Any) -> list[dict[str, Any]]:
         for reason in result.draft.reasons
         for name in reason.evidence_features
     }
-    return [
-        {
-            "feature_name": evidence.feature_name,
-            "observed_value": evidence.observed_value,
-            "contribution": evidence.contribution,
-        }
-        for evidence in result.draft.evidence
-        if evidence.feature_name in cited
-    ]
+    evidence_out = []
+    for evidence in result.draft.evidence:
+        if evidence.feature_name in cited:
+            sem = resolve_feature_semantics(evidence.feature_name)
+            friendly_name = sem.get("ten", evidence.feature_name)
+            evidence_out.append(
+                {
+                    "feature_name": friendly_name,
+                    "display_name": friendly_name,
+                    "raw_feature_name": evidence.feature_name,
+                    "observed_value": evidence.observed_value,
+                    "contribution": evidence.contribution,
+                    "unit": sem.get("don_vi", ""),
+                }
+            )
+    return evidence_out
 
 
 def _llm_call_status(result: Any) -> str:

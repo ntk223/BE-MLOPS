@@ -39,6 +39,11 @@ CHAT_SYSTEM_PROMPT = (
     "Bạn là Trợ lý Cố vấn Học thuật AI (Advisor Copilot) thuộc hệ thống cảnh báo sớm LearnGuard. "
     "Nhiệm vụ của bạn là hỗ trợ CỐ VẤN HỌC TẬP (Advisor) phân tích rủi ro học tập của sinh viên, "
     "giải thích các chỉ số từ mô hình Machine Learning, và gợi ý các giải pháp can thiệp sư phạm phù hợp.\n\n"
+    "🧠 QUY TRÌNH TƯ DUY BẮT BUỘC (CHAIN OF THOUGHT):\n"
+    "Trước khi trả lời bất kỳ câu hỏi nào của cố vấn về lý do rủi ro hay phân tích học vụ, bạn phải tự phân tích trong đầu qua 3 bước sau:\n"
+    "1. ĐỌC TRẠNG THÁI & ĐỘ BẤT ĐỊNH: Kiểm tra xem hồ sơ này có ở trạng thái 'manual_review', 'insufficient_data' hay độ bất định cao hay không?\n"
+    "2. ĐÁNH GIÁ Ý NGHĨA THỰC SỰ CỦA CON SỐ: Phân biệt rõ đâu là tín hiệu hành vi thực tế (tương tác VLE thật, bài nộp thật) và đâu là con số kỹ thuật do hệ thống ngoại suy/điền khuyết (do thiếu dữ liệu).\n"
+    "3. ĐƯA RA KẾT LUẬN ĐỘC LẬP: Nếu rủi ro cao xuất phát từ việc thiếu dữ liệu (chứ không phải học kém thực sự), bạn phải chủ động giải thích cho cố vấn hiểu bản chất kỹ thuật đó, tuyệt đối không được đánh đồng đây là sinh viên học yếu.\n\n"
     "LUẬT PHẠM VI TRẢ LỜI (BẮT BUỘC TUÂN THỦ TUYỆT ĐỐI - QUY TẮC 1 Ý ĐỊNH):\n"
     "Chỉ trả lời ĐÚNG VÀO TRỌNG TÂM câu hỏi của cố vấn, TUYỆT ĐỐI KHÔNG tự ý nói thêm các phần chưa được hỏi:\n"
     "1. Nếu cố vấn hỏi 'Tại sao / Nguyên nhân': CHỈ nêu các yếu tố làm tăng rủi ro (tối đa 3 ý chính). "
@@ -49,6 +54,20 @@ CHAT_SYSTEM_PROMPT = (
     "CẤM đề cập thuật toán AI, điểm rủi ro hay phân tích kỹ thuật.\n"
     "4. Nếu là câu chào hỏi xã giao: CHỈ phản hồi ngắn gọn 1-2 câu, sẵn sàng hỗ trợ phân tích hồ sơ sinh viên.\n"
     "5. Cuối câu trả lời, chỉ thêm duy nhất 1 câu gợi ý ngắn (tối đa 15 từ) định hướng bước tiếp theo.\n\n"
+    "QUY TẮC BẮT BUỘC THEO TRẠNG THÁI DỰ ĐOÁN (PREDICTION STATUS GUARDRAILS):\n"
+    "Luôn kiểm tra trường `trang_thai_ho_so (status)` trong DỮ LIỆU DỰ ĐOÁN trước khi đưa ra nhận định:\n"
+    "1. Trạng thái 'manual_review' (Cần xem xét thủ công):\n"
+    "   - ĐẶC BIỆT LƯU Ý: Tuyệt đối KHÔNG tự động đánh giá, KHÔNG dán nhãn khẳng định sinh viên là 'nguy cơ cao', 'rủi ro cao' hay 'chắc chắn rớt môn'.\n"
+    "   - Hệ thống CHỈ ĐƯỢC PHÉP ĐƯA RA QUAN ĐIỂM / GÓC NHÌN THAM KHẢO dựa trên các tín hiệu ghi nhận được (nêu khách quan cả yếu tố biến động và điểm tích cực nếu có).\n"
+    "   - Luôn nhấn mạnh đây chỉ là quan điểm tham khảo do mô hình có độ bất định (uncertainty) cao; quyết định và đánh giá rủi ro cuối cùng thuộc về Cố vấn học tập sau khi xem xét thủ công.\n"
+    "2. Trạng thái 'insufficient_data' (Thiếu dữ liệu):\n"
+    "   - BẮT BUỘC nêu rõ ngay từ đầu rằng hồ sơ sinh viên bị đánh tag thiếu dữ liệu học tập/hành vi đầu vào.\n"
+    "   - Nhắc nhở Cố vấn rằng điểm số (nếu có) chỉ là ngoại suy kỹ thuật trên dữ liệu điền khuyết (impute), KHÔNG phản ánh đúng thực tế.\n"
+    "   - KHÔNG tự động phân tích hay kết luận như hồ sơ có đầy đủ dữ liệu; khuyến nghị Cố vấn kiểm tra lại dữ liệu học vụ hoặc liên hệ trực tiếp sinh viên.\n"
+    "3. Trạng thái 'no_prediction' (Chưa có dự đoán):\n"
+    "   - Nêu rõ mô hình chưa sinh được dự đoán cho hồ sơ này, không tự bịa điểm số hay kết luận nguy cơ.\n"
+    "4. Trạng thái 'scored' (Đã chấm điểm thành công):\n"
+    "   - Phân tích bình thường dựa trên dữ liệu và tín hiệu SHAP đã được cung cấp.\n\n"
     "QUY TẮC DIỄN GIẢI & PHONG CÁCH TRẢ LỜI:\n"
     "1. Hoàn chỉnh nội dung: Tuyệt đối KHÔNG viết câu dẫn kiểu 'Dưới đây là...' nếu không kèm đầy đủ nội dung chi tiết ngay bên dưới; "
     "phải viết trọn vẹn toàn bộ câu trả lời, không dừng lại ở câu giới thiệu.\n"
@@ -503,25 +522,63 @@ class AdvisorChatService:
                             for s in top_signals
                             if s.get("feature_name") == feat_key
                             or feat_key in s.get("feature_name", "")
+                            or s.get("feature_name", "").endswith(feat_key)
+                            or resolve_feature_semantics(s.get("feature_name", "")).get("ten") == feat_key
                         ),
                         None,
                     )
                     if matched:
+                        raw_name = matched.get("feature_name") or feat_key
+                        sem = resolve_feature_semantics(raw_name)
+                        friendly_name = sem.get("ten", raw_name)
                         cited_evidence.append(
                             {
-                                "feature_name": matched.get("feature_name"),
+                                "feature_name": friendly_name,
+                                "display_name": friendly_name,
+                                "raw_feature_name": raw_name,
                                 "observed_value": matched.get("observed_value"),
                                 "contribution": matched.get("contribution"),
+                                "unit": sem.get("don_vi", ""),
                             }
                         )
                     elif feat_key in features:
+                        sem = resolve_feature_semantics(feat_key)
+                        friendly_name = sem.get("ten", feat_key)
                         cited_evidence.append(
                             {
-                                "feature_name": feat_key,
+                                "feature_name": friendly_name,
+                                "display_name": friendly_name,
+                                "raw_feature_name": feat_key,
                                 "observed_value": features[feat_key],
                                 "contribution": None,
+                                "unit": sem.get("don_vi", ""),
                             }
                         )
+                    else:
+                        matched_feat = next(
+                            (
+                                k
+                                for k in features
+                                if k == feat_key
+                                or k.endswith(feat_key)
+                                or feat_key.endswith(k)
+                                or resolve_feature_semantics(k).get("ten") == feat_key
+                            ),
+                            None,
+                        )
+                        if matched_feat:
+                            sem = resolve_feature_semantics(matched_feat)
+                            friendly_name = sem.get("ten", matched_feat)
+                            cited_evidence.append(
+                                {
+                                    "feature_name": friendly_name,
+                                    "display_name": friendly_name,
+                                    "raw_feature_name": matched_feat,
+                                    "observed_value": features[matched_feat],
+                                    "contribution": None,
+                                    "unit": sem.get("don_vi", ""),
+                                }
+                            )
         else:
             # Fallback for plain-text response (e.g. from FakeLLM in unit tests)
             reply_text = raw_reply
@@ -536,11 +593,15 @@ class AdvisorChatService:
                         or name.split("__")[-1] in reply_text
                         or (vi_name and vi_name in reply_text)
                     ):
+                        friendly_name = vi_name or name
                         cited_evidence.append(
                             {
-                                "feature_name": name,
+                                "feature_name": friendly_name,
+                                "display_name": friendly_name,
+                                "raw_feature_name": name,
                                 "observed_value": signal.get("observed_value"),
                                 "contribution": signal.get("contribution"),
+                                "unit": sem.get("don_vi", ""),
                             }
                         )
 
