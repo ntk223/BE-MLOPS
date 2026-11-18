@@ -11,10 +11,13 @@ instead of fabricating content (status mapping: LLM OK + clean citations ->
 """
 
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from learnguard_backend.services.llm import LLMService
+
+logger = logging.getLogger("learnguard_backend.briefs")
 
 STATUS_GENERATED = "generated"
 STATUS_FALLBACK_REVIEW = "fallback_review"
@@ -204,9 +207,19 @@ class AdvisorBriefService:
             },
         ]
 
+        logger.info(
+            "[AdvisorBrief.generate] Generating brief for prediction '%s'...",
+            prediction_id,
+        )
+
         try:
             llm = self._llm_service()
         except Exception as exc:  # noqa: BLE001 — degrade, never 500
+            logger.exception(
+                "[AdvisorBrief.generate ERROR] LLM not configured for prediction '%s': %s",
+                prediction_id,
+                exc,
+            )
             return self.make_fallback(
                 prediction_id,
                 f"llm_not_configured ({type(exc).__name__})",
@@ -214,8 +227,22 @@ class AdvisorBriefService:
             )
 
         try:
-            response = llm.complete(messages, temperature=0.2)
+            logger.info(
+                "[AdvisorBrief.generate] Calling LLM model '%s'...",
+                getattr(llm, "model_name", "unknown"),
+            )
+            response = llm.complete(messages, temperature=1.0)
+            logger.info(
+                "[AdvisorBrief.generate SUCCESS] Generated brief for '%s' in %s ms",
+                prediction_id,
+                getattr(response, "latency_ms", None),
+            )
         except Exception as exc:  # noqa: BLE001 — degrade, never 500
+            logger.exception(
+                "[AdvisorBrief.generate ERROR] LLM error for prediction '%s': %s",
+                prediction_id,
+                exc,
+            )
             result = self.make_fallback(
                 prediction_id, f"llm_error ({type(exc).__name__})"
             )

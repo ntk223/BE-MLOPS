@@ -108,3 +108,28 @@ class AuditLogEntry:
     entity: str
     entity_id: str | None = None
     payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ChatSessionRecord:
+    session_id: int | None
+    student_key: str
+    code_module: str
+    code_presentation: str
+    user_id: int
+    title: str = ""
+    status: str = "active"
+    brief_id: int | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+@dataclass
+class ChatMessageRecord:
+    message_id: int | None
+    session_id: int
+    role: str
+    content: str
+    cited_evidence: list[dict[str, Any]] = field(default_factory=list)
+    tokens_used: int = 0
+    created_at: datetime | None = None

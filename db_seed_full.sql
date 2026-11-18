@@ -12,11 +12,12 @@
 -- PII: KHÔNG có dữ liệu định danh — student_key đã băm sha256 (16 ký tự
 -- hex), không có id_student/tên/email trong toàn bộ file.
 --
--- Cách nạp (1 lần, DB đích phải TRỐNG hoặc chưa có bảng nào trùng tên):
---   psql -U <user> -d learnguard -f db_seed_full.sql
+-- Cách nạp (Hỗ trợ nạp lặp lại nhiều lần, file đã tự động DROP TABLE IF EXISTS):
+--   psql -U learnguard -d learnguard -f db_seed_full.sql
+--   (hoặc qua Docker: docker exec -i <container_name> psql -U learnguard -d learnguard < db_seed_full.sql)
 --
 -- Sau khi nạp:
---   - Backend KHÔNG cần chạy `alembic upgrade head` (baseline đã ghi)
+--   - Chạy `alembic upgrade head` để cập nhật migration mới nhất (chat_sessions, chat_messages).
 --   - Dữ liệu prediction là snapshot tại thời điểm xuất; muốn cập nhật
 --     thì chạy M5 score với --pg-dsn trỏ DB của team (upsert đè theo PK)
 -- =====================================================================
@@ -44,6 +45,27 @@ SET row_security = off;
 SET default_tablespace = '';
 
 SET default_table_access_method = heap;
+
+-- =====================================================================
+-- DỌN DẸP SẠCH CÁC BẢNG VÀ SEQUENCE CŨ TRƯỚC KHI SEED (IDEMPOTENT)
+-- =====================================================================
+DROP TABLE IF EXISTS public.chat_messages CASCADE;
+DROP TABLE IF EXISTS public.chat_sessions CASCADE;
+DROP TABLE IF EXISTS public.decisions CASCADE;
+DROP TABLE IF EXISTS public.briefs CASCADE;
+DROP TABLE IF EXISTS public.llm_calls CASCADE;
+DROP TABLE IF EXISTS public.audit_logs CASCADE;
+DROP TABLE IF EXISTS public.ml_predictions CASCADE;
+DROP TABLE IF EXISTS public.users CASCADE;
+DROP TABLE IF EXISTS public.alembic_version CASCADE;
+
+DROP SEQUENCE IF EXISTS public.chat_messages_message_id_seq CASCADE;
+DROP SEQUENCE IF EXISTS public.chat_sessions_session_id_seq CASCADE;
+DROP SEQUENCE IF EXISTS public.audit_logs_log_id_seq CASCADE;
+DROP SEQUENCE IF EXISTS public.briefs_brief_id_seq CASCADE;
+DROP SEQUENCE IF EXISTS public.decisions_decision_id_seq CASCADE;
+DROP SEQUENCE IF EXISTS public.llm_calls_call_id_seq CASCADE;
+DROP SEQUENCE IF EXISTS public.users_user_id_seq CASCADE;
 
 --
 -- Name: alembic_version; Type: TABLE; Schema: public; Owner: -
