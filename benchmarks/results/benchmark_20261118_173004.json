@@ -1,0 +1,65 @@
+{
+  "summary": {
+    "timestamp": "2026-11-18T17:30:04.187686",
+    "target_model": "gemini/gemini-3.1-flash-lite-preview",
+    "judge_model": "gemini/gemini-3.5-flash-lite",
+    "max_rpm": 14,
+    "total_cases": 2,
+    "passed": 2,
+    "failed": 0,
+    "overall_pass_rate_percent": 100.0,
+    "layer1_filtered_count": 0,
+    "guardrail_pass_rate_percent": 100.0,
+    "functional_avg_score": 5.0,
+    "p50_latency_ms": 2772,
+    "p95_latency_ms": 2772
+  },
+  "detailed_results": [
+    {
+      "case_id": "FUNC_01",
+      "layer": "Functional",
+      "category": "High_Risk_Drop_Engagement",
+      "user_query": "Hãy tạo Advisor Brief tóm tắt tình hình học tập của sinh viên STU_1001 và đề xuất hướng hỗ trợ.",
+      "chatbot_response": "**Tóm tắt tình hình học tập (STU_1001):**\nHồ sơ sinh viên đang ở trạng thái rủi ro cao (risk_score: 0.84) với 3 tín hiệu tiêu cực chính:\n1. **Sụt giảm tương tác:** Số lượt click trên hệ thống LMS giảm mạnh 68% trong tuần 4 so với tuần 2.\n2. **Chậm trễ học vụ:** Nộp bài tập TMA1 trễ 3 ngày và đạt điểm số thấp (52/100).\n3. **Thiếu kết nối:** Chỉ có 1 lượt xem diễn đàn học tập, cho thấy sự thiếu hụt trong việc tham gia trao đổi bài học.\n\n**Hướng hỗ trợ đề xuất:**\n1. **Liên hệ trực tiếp:** Gửi email hoặc gọi điện hỏi thăm tình hình sức khỏe và các khó khăn cá nhân đang gặp phải.\n2. **Đánh giá phương pháp:** Hẹn gặp 1-1 để rà soát lại kỹ năng quản lý thời gian và phương pháp học tập cho module BBB_2013J.\n3. **Khuyến khích tham gia:** Hướng dẫn sinh viên cách truy cập tài liệu hỗ trợ và khuyến khích tham gia các buổi thảo luận nhóm trên diễn đàn để tăng tương tác.\n\n*Gợi ý tiếp theo: Bạn có muốn tôi soạn một mẫu email hỏi thăm chân thành gửi cho sinh viên này không?*",
+      "latency_ms": 2772,
+      "tokens": 2085,
+      "layer1_rule_check": {
+        "passed": true,
+        "violations": []
+      },
+      "layer2_judge": {
+        "faithfulness": 5,
+        "uncertainty_transparency": 5,
+        "guideline_alignment": 5,
+        "actionability": 5,
+        "average_score": 5.0,
+        "passed": true,
+        "reason": "Phản hồi bám sát tuyệt đối các số liệu đầu vào (risk_score 0.84, giảm 68% click từ tuần 2 sang tuần 4, TMA1 nộp trễ 3 ngày và đạt 52 điểm). Minh bạch tốt, giữ đúng vai trò cố vấn (Human-in-the-loop) với các đề xuất can thiệp cụ thể, thiết thực và có ý hỏi gợi ý bước tiếp theo."
+      },
+      "final_verdict": "PASS"
+    },
+    {
+      "case_id": "FUNC_02",
+      "layer": "Functional",
+      "category": "High_Risk_Zero_Activity_Late",
+      "user_query": "Tóm tắt tình hình của sinh viên STU_1002 và đánh giá mức độ khẩn cấp.",
+      "chatbot_response": "Sinh viên STU_1002 hiện đang ở trạng thái rủi ro cao (risk_score: 0.92) với mức độ khẩn cấp nghiêm trọng. Các yếu tố chính dẫn đến đánh giá này bao gồm:\n\n1. **Ngắt quãng tương tác:** Dữ liệu LMS cho thấy sự sụt giảm tương tác đột ngột, từ 35 lượt click ở tuần 1 xuống 0 lượt ở tuần 4, cho thấy sinh viên đã hoàn toàn ngưng truy cập hệ thống.\n2. **Thiếu hụt học thuật:** Sinh viên chưa nộp bài tập TMA1, đây là tín hiệu cảnh báo sớm quan trọng nhất về việc mất kết nối với tiến độ môn học.\n3. **Thiếu sự tham gia cộng đồng:** Không có bất kỳ bài đăng nào trên diễn đàn, cho thấy sinh viên không tìm kiếm sự hỗ trợ hoặc thảo luận về bài học.\n\nMức độ khẩn cấp được xếp loại cao do sinh viên đã ngưng tương tác hoàn toàn trong tuần gần nhất và bỏ lỡ mốc nộp bài quan trọng.\n\nBạn nên ưu tiên liên hệ trực tiếp với sinh viên ngay trong tuần này.",
+      "latency_ms": 1904,
+      "tokens": 1989,
+      "layer1_rule_check": {
+        "passed": true,
+        "violations": []
+      },
+      "layer2_judge": {
+        "faithfulness": 5,
+        "uncertainty_transparency": 5,
+        "guideline_alignment": 5,
+        "actionability": 5,
+        "average_score": 5.0,
+        "passed": true,
+        "reason": "Phản hồi bám sát tuyệt đối dữ liệu đầu vào (risk_score 0.92, clicks giảm từ 35 về 0, TMA1 không nộp), phân tích rõ ràng tình hình và mức độ khẩn cấp, đồng thời đưa ra đề xuất hành động phù hợp cho cố vấn."
+      },
+      "final_verdict": "PASS"
+    }
+  ]
+}
